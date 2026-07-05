@@ -1,0 +1,1187 @@
+<!DOCTYPE html>
+<html lang="fr">
+<!-- ============================================================
+TRACÉ v3c — BUILD COLLECTE. Fichier autonome, zéro build.
+Objectif unique : enregistrer de VRAIS trajets pour recalibrer
+TH/PEN (voir CLAUDE.md). Aucune feature nouvelle vs v3.
+
+Déploiement : héberger ce fichier en HTTPS (GitHub Pages suffit),
+l'ouvrir sur le téléphone. HTTPS est requis pour les capteurs iOS,
+le wake lock ET crypto.subtle (sinon la chaîne ne scelle rien).
+
+Fixes vs v3 (artifact) :
+ 1. Wake lock — l'écran reste allumé pendant veille + trajet,
+    réacquis au retour de visibilité. Sans ça, iOS coupe les
+    capteurs au verrouillage.
+ 2. Stockage — window.storage (artifact) → localStorage →
+    mémoire, dans cet ordre. Clé v3c, pas de migration v3.
+ 3. Snapshot du trajet en cours toutes les 30 s → un crash ou un
+    refresh ne perd plus le trajet (récupéré au prochain
+    lancement, proposé à l'écran rôle avec option "jeter").
+ 4. La veille n'auto-démarre plus de trajet tant qu'un trajet
+    attend son rôle (l'écrasement silencieux de `pending` est
+    corrigé) ; AUTO.stopMs 90 s → 240 s (feux rouges, bouchons).
+ 5. Chaîne d'intégrité : plus de troncature à 60 trajets (elle
+    s'auto-rompait au 61e) ; le hash scelle désormais TOUT le
+    trajet (événements détaillés + tracé GPS), plus seulement
+    le nombre d'événements.
+ 6. Attache capteurs idempotente — veille + démarrage manuel ne
+    double plus les listeners ; la démo désarme la veille au lieu
+    d'orpheliner son cleanup.
+ Divers : trajets < 30 s sans événement ni distance ignorés,
+ durées > 1 h lisibles (fmtDur), état "chaîne inactive" affiché
+ hors HTTPS.
+============================================================ -->
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0A0F14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>TRACÉ — collecte</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<!-- Babel épinglé en v7 : le preset react de Babel 8 émet des `import` (runtime automatique) qui cassent l'exécution inline -->
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+<style>
+html,body{margin:0;padding:0;background:#0A0F14;}
+#root{min-height:100vh;}
+.ds-root{
+  --bg:#0A0F14; --surface:#131C24; --surface2:#1D2A34;
+  --ink:#E8EDF1; --muted:#6B7C8A;
+  --good:#2FD08A; --warn:#F4B740; --bad:#F2604C; --volt:#4CC2FF;
+  --line:rgba(76,194,255,.14); --line2:rgba(232,237,241,.07);
+  font-family:'Space Grotesk',system-ui,sans-serif;
+  color:var(--ink); background:var(--bg);
+  min-height:100vh; width:100%; -webkit-font-smoothing:antialiased;
+}
+.ds-root *{box-sizing:border-box;}
+.ds-root button{font-family:inherit;cursor:pointer;}
+.tone-good{color:var(--good);} .tone-warn{color:var(--warn);} .tone-bad{color:var(--bad);}
+
+.ds-head{display:flex;align-items:baseline;gap:12px;padding:20px 20px 0;}
+.ds-mark{font-weight:700;font-size:20px;letter-spacing:.16em;}
+.ds-tag{font-family:'JetBrains Mono',monospace;font-size:11px;text-transform:uppercase;letter-spacing:.14em;color:var(--volt);}
+
+.ds-home,.ds-summary,.ds-passport,.ds-roleask{min-height:100vh;display:flex;flex-direction:column;gap:22px;padding-bottom:32px;
+  background:radial-gradient(120% 60% at 50% -5%, rgba(76,194,255,.10), transparent 60%);}
+.ds-pitch{padding:0 20px;}
+.ds-pitch h1{font-size:clamp(30px,8vw,42px);line-height:1.04;font-weight:700;margin:14px 0;letter-spacing:-.01em;}
+.ds-pitch p{color:var(--muted);font-size:15px;line-height:1.55;max-width:44ch;margin:0;}
+.ds-cta{padding:0 20px;display:flex;flex-direction:column;gap:10px;}
+.ds-btn{padding:16px;border-radius:13px;border:1px solid transparent;font-size:16px;font-weight:600;transition:filter .15s,transform .1s,border-color .15s;}
+.ds-btn:active{transform:translateY(1px);}
+.ds-btn-primary{background:var(--volt);color:#04141f;}
+.ds-btn-primary:hover{filter:brightness(1.08);}
+.ds-btn-ghost{background:transparent;border-color:var(--line2);color:var(--ink);}
+.ds-btn-ghost:hover{border-color:var(--volt);}
+.ds-btn-passport{background:var(--surface2);border-color:var(--line);color:var(--volt);}
+.ds-btn-armed{background:rgba(76,194,255,.08);border-color:var(--volt);color:var(--volt);display:flex;align-items:center;justify-content:center;gap:10px;}
+.ds-fine{color:var(--muted);font-size:12.5px;line-height:1.5;margin:4px 0 0;}
+.ds-finewarn{color:var(--warn);}
+
+.ds-history{margin:0 20px;background:var(--surface);border:1px solid var(--line2);border-radius:16px;padding:16px 16px 10px;}
+.ds-history-top{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;}
+.ds-hlabel{font-family:'JetBrains Mono',monospace;font-size:11px;text-transform:uppercase;letter-spacing:.14em;color:var(--muted);}
+.ds-avg{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--muted);}
+.ds-avg b{color:var(--good);font-size:16px;}
+.ds-avg b.tone-bad{color:var(--bad);}
+.ds-triplist{display:flex;flex-direction:column;}
+.ds-triprow{display:flex;align-items:center;gap:11px;padding:9px 2px;border-top:1px solid var(--line2);}
+.ds-triprow:first-child{border-top:none;}
+.ds-triprow.passenger{opacity:.5;}
+.ds-dot{width:8px;height:8px;border-radius:99px;flex:none;background:currentColor;}
+.ds-dot.good{color:var(--good);} .ds-dot.warn{color:var(--warn);} .ds-dot.bad{color:var(--bad);} .ds-dot.off{color:var(--muted);}
+.ds-tripscore{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:17px;width:34px;}
+.ds-tripmeta{flex:1;font-size:12.5px;color:var(--muted);font-family:'JetBrains Mono',monospace;}
+.ds-tripdate{font-size:12px;color:var(--muted);font-family:'JetBrains Mono',monospace;}
+.ds-empty{color:var(--muted);font-size:14px;line-height:1.5;display:flex;flex-direction:column;gap:8px;}
+.ds-note{font-size:12px;opacity:.8;}
+
+.ds-drive{min-height:100vh;display:flex;flex-direction:column;padding-bottom:16px;}
+.ds-drivetop{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:16px 18px 4px;}
+.ds-end{background:transparent;border:1px solid var(--line2);color:var(--ink);padding:9px 16px;border-radius:10px;font-size:14px;font-weight:600;}
+.ds-end:hover{border-color:var(--bad);color:var(--bad);}
+.ds-caltag{font-family:'JetBrains Mono',monospace;font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;}
+.ds-livetag{font-family:'JetBrains Mono',monospace;font-size:12px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);display:flex;align-items:center;gap:7px;}
+.ds-pulse{width:8px;height:8px;border-radius:99px;background:var(--bad);animation:dspulse 1.1s ease-in-out infinite;}
+.ds-pulse.demo{background:var(--volt);}
+@keyframes dspulse{0%,100%{opacity:.35;}50%{opacity:1;}}
+
+.ds-hud{display:flex;align-items:center;justify-content:center;gap:20px;padding:6px 18px 0;}
+.ds-hud-speed{display:flex;align-items:baseline;gap:8px;}
+.ds-hud-val{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:56px;line-height:1;}
+.ds-hud-unit{font-family:'JetBrains Mono',monospace;font-size:14px;color:var(--muted);}
+.ds-hud-speed.over .ds-hud-val{color:var(--bad);text-shadow:0 0 24px rgba(242,96,76,.5);}
+.ds-sign{width:54px;height:54px;border-radius:99px;background:#fff;border:6px solid #D53832;
+  display:flex;align-items:center;justify-content:center;flex:none;}
+.ds-sign span{color:#111;font-weight:700;font-size:19px;font-family:'Space Grotesk',sans-serif;}
+.ds-sign.over{animation:dspulse 0.9s ease-in-out infinite;}
+
+.ds-gauge{position:relative;width:min(64vw,260px);aspect-ratio:1;margin:2px auto;}
+.ds-gauge.frozen{opacity:.45;}
+.ds-gsvg{width:100%;height:100%;display:block;}
+.ds-ring-bg{fill:none;stroke:var(--surface2);stroke-width:10;}
+.ds-ring-fg{fill:none;stroke-width:10;stroke-linecap:round;transition:stroke-dasharray .3s ease,stroke .4s ease;}
+.ds-ring-fg.tone-good{stroke:var(--good);} .ds-ring-fg.tone-warn{stroke:var(--warn);} .ds-ring-fg.tone-bad{stroke:var(--bad);}
+.ds-meter-ring{fill:rgba(76,194,255,.03);stroke:var(--line);stroke-width:1;}
+.ds-meter-inner{fill:none;stroke:var(--line2);stroke-width:1;}
+.ds-cross{stroke:var(--line2);stroke-width:1;}
+.ds-gdot{transition:cx .08s linear,cy .08s linear,r .08s linear;filter:drop-shadow(0 0 6px currentColor);}
+.ds-gdot.tone-good{fill:var(--good);color:var(--good);}
+.ds-gdot.tone-warn{fill:var(--warn);color:var(--warn);}
+.ds-gdot.tone-bad{fill:var(--bad);color:var(--bad);}
+.ds-gauge-center{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;pointer-events:none;}
+.ds-score{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:44px;line-height:1;}
+.ds-grade{font-size:12px;font-weight:600;margin-top:4px;text-transform:uppercase;letter-spacing:.08em;}
+
+.ds-readout{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;padding:8px 18px 0;}
+.ds-metric{background:var(--surface);border:1px solid var(--line2);border-radius:12px;padding:10px 6px;display:flex;flex-direction:column;align-items:center;gap:2px;}
+.ds-mval{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:17px;}
+.ds-mlabel{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;}
+.ds-hint{margin:12px 18px 0;background:rgba(244,183,64,.1);border:1px solid rgba(244,183,64,.3);color:var(--warn);border-radius:11px;padding:11px 13px;font-size:13px;line-height:1.45;}
+
+.ds-log{flex:1;overflow-y:auto;padding:12px 18px 0;display:flex;flex-direction:column;gap:7px;}
+.ds-logempty{color:var(--muted);font-size:13px;text-align:center;padding-top:12px;font-family:'JetBrains Mono',monospace;}
+.ds-logrow{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:10px;background:var(--surface);border-left:3px solid var(--muted);animation:dsin .25s ease both;}
+.ds-logrow.sev-light{border-left-color:var(--muted);}
+.ds-logrow.sev-med{border-left-color:var(--warn);}
+.ds-logrow.sev-hard{border-left-color:var(--bad);}
+@keyframes dsin{from{opacity:0;transform:translateX(-6px);}to{opacity:1;transform:none;}}
+.ds-logsev{font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;flex:1;}
+.ds-logrow.sev-med .ds-logsev{color:var(--warn);}
+.ds-logrow.sev-hard .ds-logsev{color:var(--bad);}
+.ds-logg{font-family:'JetBrains Mono',monospace;font-size:13px;}
+.ds-logt{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--muted);}
+
+.ds-roleask .ds-role-body{margin:auto 20px;display:flex;flex-direction:column;gap:14px;background:var(--surface);
+  border:1px solid var(--line);border-radius:18px;padding:24px;}
+.ds-role-body h2{margin:0;font-size:26px;}
+.ds-role-body p{margin:0 0 6px;color:var(--muted);font-size:14.5px;line-height:1.55;}
+
+.ds-finalscore{display:flex;flex-direction:column;align-items:center;gap:4px;margin-top:2px;}
+.ds-bigscore{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:88px;line-height:1;text-shadow:0 0 40px currentColor;}
+.ds-grade.big{font-size:16px;}
+.ds-tripsub{font-family:'JetBrains Mono',monospace;font-size:12.5px;color:var(--muted);margin-top:2px;text-align:center;}
+.ds-breakdown{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;padding:0 20px;}
+.ds-bk{background:var(--surface);border:1px solid var(--line2);border-radius:12px;padding:13px 6px;display:flex;flex-direction:column;align-items:center;gap:3px;}
+.ds-bkn{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:22px;}
+.ds-bkl{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;}
+.ds-coach{margin:0 20px;background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:18px;}
+.ds-coach-h{font-family:'JetBrains Mono',monospace;font-size:11px;text-transform:uppercase;letter-spacing:.14em;color:var(--volt);display:block;margin-bottom:10px;}
+.ds-coach-line{margin:0 0 9px;font-size:14.5px;line-height:1.5;}
+.ds-coach-line:last-child{margin-bottom:0;}
+.ds-progress{margin:0 20px;}
+
+.ds-route{margin:0 20px;background:var(--surface);border:1px solid var(--line2);border-radius:16px;padding:14px 14px 8px;}
+.ds-route-svg{width:100%;height:150px;display:block;margin-top:6px;}
+.ds-route-line{fill:none;stroke:var(--volt);stroke-width:2;stroke-linejoin:round;opacity:.85;}
+.ds-route-start{fill:var(--good);}
+.ds-route-ev.warn{fill:var(--warn);} .ds-route-ev.bad{fill:var(--bad);}
+
+.ds-pass-empty{margin:0 20px;color:var(--muted);font-size:14.5px;line-height:1.6;display:flex;flex-direction:column;gap:16px;background:var(--surface);border:1px solid var(--line2);border-radius:16px;padding:22px;}
+.ds-card{margin:0 20px;background:linear-gradient(160deg,var(--surface2),var(--surface));border:1px solid var(--line);border-radius:18px;padding:20px;box-shadow:0 12px 40px rgba(0,0,0,.35);}
+.ds-card-top{display:flex;gap:18px;align-items:center;}
+.ds-seal{position:relative;width:104px;height:104px;flex:none;}
+.ds-seal svg{width:100%;height:100%;}
+.ds-seal-ring{fill:none;stroke:currentColor;stroke-width:3;stroke-dasharray:4 3;}
+.ds-seal-inner{fill:rgba(76,194,255,.04);stroke:var(--line2);stroke-width:1;}
+.ds-seal-center{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;}
+.ds-seal-score{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:34px;}
+.ds-card-id{display:flex;flex-direction:column;gap:5px;}
+.ds-card-grade{font-weight:700;font-size:18px;text-transform:uppercase;letter-spacing:.08em;}
+.ds-card-line{font-family:'JetBrains Mono',monospace;font-size:12.5px;color:var(--muted);}
+.ds-card-line.tone-good{color:var(--good);} .ds-card-line.tone-bad{color:var(--bad);}
+.ds-card-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:18px;}
+.ds-cs{background:rgba(10,15,20,.5);border:1px solid var(--line2);border-radius:11px;padding:10px 4px;display:flex;flex-direction:column;align-items:center;gap:2px;}
+.ds-cs-n{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:18px;}
+.ds-cs-l{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;}
+.ds-chain{margin-top:14px;border-radius:11px;padding:10px 13px;font-size:12.5px;line-height:1.45;font-family:'JetBrains Mono',monospace;}
+.ds-chain.ok{background:rgba(47,208,138,.08);border:1px solid rgba(47,208,138,.3);color:var(--good);}
+.ds-chain.bad{background:rgba(242,96,76,.08);border:1px solid rgba(242,96,76,.35);color:var(--bad);}
+.ds-chain.warn{background:rgba(244,183,64,.08);border:1px solid rgba(244,183,64,.35);color:var(--warn);}
+.ds-card-foot{margin:14px 0 0;font-size:11.5px;line-height:1.5;color:var(--muted);font-family:'JetBrains Mono',monospace;}
+.ds-pass-spark{margin-top:-4px;}
+
+.ds-spark{width:100%;height:64px;display:block;margin-top:8px;overflow:visible;}
+.ds-spark-area{fill:rgba(76,194,255,.10);}
+.ds-spark-line{fill:none;stroke:var(--volt);stroke-width:2;stroke-linejoin:round;}
+.ds-spark-pt{fill:var(--volt);}
+.ds-sparkempty{color:var(--muted);font-family:'JetBrains Mono',monospace;font-size:12.5px;padding:10px 0;}
+
+@media (prefers-reduced-motion:reduce){
+  .ds-gdot,.ds-ring-fg{transition:none;}
+  .ds-pulse,.ds-sign.over{animation:none;opacity:.8;}
+  .ds-logrow{animation:none;}
+}
+@media (min-width:560px){
+  .ds-home,.ds-summary,.ds-drive,.ds-passport,.ds-roleask{max-width:480px;margin:0 auto;}
+}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<noscript>TRACÉ a besoin de JavaScript.</noscript>
+<script type="text/babel" data-presets="react">
+const { useState, useRef, useEffect, useCallback } = React;
+
+const STORE_KEY = "trace:trips:v3c";
+const DRAFT_KEY = "trace:draft:v3c";
+
+// ---------- PARAMÈTRES (tout se règle ici) ----------
+const G = 9.81;
+const TH = { light: 0.30, med: 0.45, hard: 0.62 };          // seuils d'à-coups (g)
+const PEN = { light: 2, med: 5, hard: 9 };                   // pénalités
+const PEN_SPEED = { minor: 4, major: 10 };                   // excès <15 / >=15 km/h
+const COOLDOWN = 1200;                                       // ms entre événements
+const ROT_UNSTABLE = 60, ROT_STABLE = 25;                    // °/s gyroscope (hystérésis)
+const STABLE_DELAY = 1500;                                   // ms de calme avant reprise
+const FWD = { min: 0.08, max: 0.28, need: 3.0 };             // calibration axe avant
+const AUTO = { startKmh: 18, startMs: 8000, stopKmh: 6, stopMs: 240000 }; // stop 4 min : feux + bouchons
+const OVERSPEED_TOL = 5;                                     // km/h de tolérance
+const OVERSPEED_SUSTAIN = 5000;                              // ms au-dessus avant événement
+const SNAPSHOT_MS = 30000;                                   // fréquence du snapshot anti-crash
+const DRAFT_MIN_MS = 60000;                                  // draft récupérable si >= 1 min de données
+const MIN_TRIP_SEC = 30;                                     // en-dessous, sans évt ni distance : ignoré
+
+const HASH_OK = typeof crypto !== "undefined" && !!crypto.subtle; // faux hors HTTPS
+
+// ---------- stockage : artifact → localStorage → mémoire ----------
+const storageDriver = (() => {
+  if (typeof window !== "undefined" && window.storage && typeof window.storage.get === "function") {
+    return {
+      name: "artifact",
+      get: async (k) => { const r = await window.storage.get(k); return r && r.value != null ? r.value : null; },
+      set: async (k, v) => { await window.storage.set(k, v); },
+      del: async (k) => { try { await window.storage.delete(k); } catch (e) { try { await window.storage.set(k, ""); } catch (e2) {} } },
+    };
+  }
+  try {
+    const t = "__trace_test__";
+    localStorage.setItem(t, "1"); localStorage.removeItem(t);
+    return {
+      name: "local",
+      get: async (k) => localStorage.getItem(k),
+      set: async (k, v) => { localStorage.setItem(k, v); },
+      del: async (k) => { localStorage.removeItem(k); },
+    };
+  } catch (e) {}
+  const mem = new Map();
+  return {
+    name: "memory",
+    get: async (k) => (mem.has(k) ? mem.get(k) : null),
+    set: async (k, v) => { mem.set(k, v); },
+    del: async (k) => { mem.delete(k); },
+  };
+})();
+
+async function loadTrips() {
+  try { const raw = await storageDriver.get(STORE_KEY); return raw ? JSON.parse(raw) : []; }
+  catch (e) { return []; }
+}
+async function saveTrips(t) {
+  try { await storageDriver.set(STORE_KEY, JSON.stringify(t)); return true; }
+  catch (e) { return false; }
+}
+
+// ---------- chaîne d'intégrité ----------
+async function sha256(str) {
+  try {
+    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
+    return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+  } catch (e) { return "nohash"; }
+}
+// Scelle TOUT le trajet (événements détaillés + tracé), pas juste le nombre d'événements.
+const tripCore = (t) =>
+  JSON.stringify({ id: t.id, date: t.date, score: t.score, durationSec: t.durationSec,
+    distanceKm: t.distanceKm, role: t.role, mode: t.mode, unstableSec: t.unstableSec,
+    recovered: !!t.recovered, events: t.events || [], path: t.path || [] });
+async function sealTrip(trip, prevHash) {
+  trip.prevHash = prevHash || "genesis";
+  trip.hash = await sha256(trip.prevHash + tripCore(trip));
+  return trip;
+}
+async function verifyChain(trips) {
+  // trips[0] = plus récent ; la chaîne se lit de l'ancien vers le récent.
+  // Aucun trajet n'est jamais tronqué → l'ancrage "genesis" reste valide.
+  const asc = [...trips].reverse();
+  let prev = "genesis";
+  for (const t of asc) {
+    if (!t.hash) return false;
+    const h = await sha256((t.prevHash || "genesis") + tripCore(t));
+    if (h !== t.hash || (t.prevHash || "genesis") !== prev) return false;
+    prev = t.hash;
+  }
+  return true;
+}
+
+// ---------- limites de vitesse ----------
+const limitCache = new Map();
+async function fetchSpeedLimit(lat, lon) {
+  const key = `${lat.toFixed(3)},${lon.toFixed(3)}`;
+  if (limitCache.has(key)) return limitCache.get(key);
+  try {
+    const q = `[out:json][timeout:5];way(around:40,${lat},${lon})["maxspeed"];out tags 1;`;
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), 5000);
+    const res = await fetch("https://overpass-api.de/api/interpreter", {
+      method: "POST", body: q, signal: ctrl.signal,
+    });
+    clearTimeout(to);
+    const data = await res.json();
+    const ms = data.elements && data.elements[0] && data.elements[0].tags ? data.elements[0].tags.maxspeed : null;
+    const v = ms ? parseInt(ms, 10) : null;
+    const out = Number.isFinite(v) ? v : null;
+    limitCache.set(key, out);
+    return out;
+  } catch (e) { limitCache.set(key, null); return null; } // réseau bloqué → on dégrade
+}
+
+// ---------- utilitaires ----------
+const sevOf = (g) => (g >= TH.hard ? "hard" : g >= TH.med ? "med" : "light");
+const fmtT = (s) => `${Math.floor(s / 60)}:${Math.floor(s % 60).toString().padStart(2, "0")}`;
+const fmtDur = (s) => s >= 3600
+  ? `${Math.floor(s / 3600)}h${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}`
+  : fmtT(s);
+const gradeOf = (s) =>
+  s >= 90 ? { label: "Exemplaire", tone: "good" } :
+  s >= 75 ? { label: "Solide", tone: "good" } :
+  s >= 60 ? { label: "Perfectible", tone: "warn" } :
+  s >= 40 ? { label: "Brusque", tone: "bad" } : { label: "À risque", tone: "bad" };
+const TYPE_LABEL = { brake: "freinage", accel: "accélération", turn: "virage", jolt: "à-coup", speed: "excès vitesse" };
+function haversine(a, b) {
+  const R = 6371000, r = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * r, dLon = (b.lon - a.lon) * r;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+const compressPath = (pts) => pts.filter((_, i) => i % 3 === 0).map((p) => [
+  Math.round(p.lat * 1e5) / 1e5, Math.round(p.lon * 1e5) / 1e5, Math.round(p.t)]);
+function draftToTrip(d) {
+  return {
+    id: d.startAt, date: new Date(d.startAt).toISOString(),
+    score: Math.max(0, Math.round(100 - (d.penalty || 0))),
+    durationSec: Math.round((d.savedAt - d.startAt) / 1000),
+    distanceKm: Math.round((d.dist || 0) / 100) / 10,
+    events: d.events || [], path: d.path || [],
+    unstableSec: Math.round((d.unstableMs || 0) / 1000),
+    mode: d.mode || "live", recovered: true,
+  };
+}
+function coachLines(events) {
+  const c = { brake: 0, accel: 0, turn: 0, jolt: 0, speed: 0 };
+  events.forEach((e) => c[e.type || "jolt"]++);
+  const out = [];
+  if (!events.length) { out.push("Trajet net, zéro événement. Le profil que les assureurs récompensent."); return out; }
+  if (c.speed >= 1) out.push(`${c.speed} excès de vitesse : c'est le facteur n°1 pour un assureur, avant même les freinages. Cale-toi sur la limite, tout le reste devient secondaire.`);
+  if (c.brake >= 2) out.push(`${c.brake} freinages brusques : regarde plus loin devant, lève le pied plus tôt.`);
+  if (c.accel >= 2) out.push(`${c.accel} accélérations sèches : reprise progressive, ça coûte zéro temps et beaucoup de points.`);
+  if (c.turn >= 2) out.push(`${c.turn} virages appuyés : entre moins vite, ressors plus propre.`);
+  if (!out.length) out.push("Conduite globalement souple. Encore un cran de douceur et tu montes de grade.");
+  return out;
+}
+
+// ============================================================
+function TraceCollect() {
+  const [screen, setScreen] = useState("home"); // home | drive | role | summary | passport
+  const [trips, setTrips] = useState([]);
+  const [storageOk, setStorageOk] = useState(true);
+  const [mode, setMode] = useState(null); // live | demo
+  const [armed, setArmed] = useState(false); // mode veille
+  const [hint, setHint] = useState("");
+  const [ui, setUi] = useState(initUi());
+  const [events, setEvents] = useState([]);
+  const [pending, setPending] = useState(null); // trajet en attente de rôle
+  const [summary, setSummary] = useState(null);
+  const [chainOk, setChainOk] = useState(null);
+
+  function initUi() {
+    return { score: 100, gx: 0, gy: 0, gMag: 0, speed: 0, elapsed: 0, count: 0,
+      cal: false, stable: true, unstableSec: 0, limit: null };
+  }
+
+  // refs moteur
+  const running = useRef(false);
+  const startAt = useRef(0);
+  const penalty = useRef(0);
+  const eventsRef = useRef([]);
+  const lastEvAt = useRef(0);
+  const grav = useRef({ x: 0, y: 0, z: 0, set: false });
+  const fwd = useRef({ x: 0, y: 0, z: 0, acc: 0, locked: false });
+  const gNow = useRef({ x: 0, y: 0, mag: 0 });
+  const rotEma = useRef(0);
+  const stable = useRef(true);
+  const stableSince = useRef(0);
+  const unstableMs = useRef(0);
+  const lastTick = useRef(0);
+  const speedRef = useRef(0);
+  const distRef = useRef(0);
+  const lastPos = useRef(null);
+  const pathRef = useRef([]); // {lat,lon,t}
+  const limitRef = useRef(null);
+  const overSince = useRef(0);
+  const lastLimitFetch = useRef(0);
+  const autoState = useRef({ overSince: 0, underSince: 0 });
+  const gotReading = useRef(false);
+  const cleanupRef = useRef(() => {});
+  const sensorsOn = useRef(false);   // attache idempotente (fix double listeners)
+  const wakeRef = useRef(null);      // sentinelle wake lock
+  const demoTimer = useRef(null);
+  const beginTripRef = useRef(() => {});
+  const endTripRef = useRef(() => {});
+  const armedRef = useRef(false);
+  const autoStartedRef = useRef(false);
+  const pendingRef = useRef(null);   // bloque l'auto-start tant qu'un rôle est en attente
+  useEffect(() => { armedRef.current = armed; }, [armed]);
+  useEffect(() => { pendingRef.current = pending; }, [pending]);
+
+  // ---------- wake lock : l'écran reste allumé pendant veille + trajet ----------
+  const acquireWake = useCallback(async () => {
+    if (!("wakeLock" in navigator)) return false;
+    if (wakeRef.current) return true;
+    try {
+      const s = await navigator.wakeLock.request("screen");
+      wakeRef.current = s;
+      s.addEventListener("release", () => { if (wakeRef.current === s) wakeRef.current = null; });
+      return true;
+    } catch (e) { return false; }
+  }, []);
+  const releaseWake = useCallback(() => {
+    try { if (wakeRef.current) wakeRef.current.release(); } catch (e) {}
+    wakeRef.current = null;
+  }, []);
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState === "visible" && (running.current || armedRef.current)) acquireWake();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [acquireWake]);
+
+  // ---------- chargement + récupération d'un trajet interrompu ----------
+  useEffect(() => {
+    (async () => {
+      setStorageOk(storageDriver.name !== "memory");
+      const t = await loadTrips();
+      setTrips(t);
+      setChainOk(await verifyChain(t));
+      try {
+        const raw = await storageDriver.get(DRAFT_KEY);
+        if (raw) {
+          const d = JSON.parse(raw);
+          if (d && d.startAt && d.savedAt - d.startAt >= DRAFT_MIN_MS) {
+            setPending(draftToTrip(d));
+            setScreen("role");
+          } else await storageDriver.del(DRAFT_KEY);
+        }
+      } catch (e) {}
+    })();
+  }, []);
+
+  // ---------- snapshot anti-crash (trajets réels uniquement) ----------
+  useEffect(() => {
+    if (screen !== "drive" || mode === "demo") return;
+    const iv = setInterval(() => {
+      if (!running.current) return;
+      const draft = {
+        startAt: startAt.current, savedAt: Date.now(),
+        penalty: penalty.current, events: eventsRef.current,
+        dist: distRef.current, unstableMs: unstableMs.current,
+        mode, path: compressPath(pathRef.current),
+      };
+      storageDriver.set(DRAFT_KEY, JSON.stringify(draft)).catch(() => {});
+    }, SNAPSHOT_MS);
+    return () => clearInterval(iv);
+  }, [screen, mode]);
+
+  // ---------- rafraîchissement HUD ----------
+  useEffect(() => {
+    if (screen !== "drive") return;
+    const iv = setInterval(() => {
+      if (!running.current) return;
+      setUi({
+        score: Math.max(0, Math.round(100 - penalty.current)),
+        gx: gNow.current.x, gy: gNow.current.y, gMag: gNow.current.mag,
+        speed: speedRef.current,
+        elapsed: (Date.now() - startAt.current) / 1000,
+        count: eventsRef.current.length,
+        cal: fwd.current.locked,
+        stable: stable.current,
+        unstableSec: Math.round(unstableMs.current / 1000),
+        limit: limitRef.current,
+      });
+    }, 80);
+    return () => clearInterval(iv);
+  }, [screen]);
+
+  const registerEvent = useCallback((gDyn, type, pen) => {
+    const now = Date.now();
+    if (type !== "speed" && now - lastEvAt.current < COOLDOWN) return;
+    if (type !== "speed") lastEvAt.current = now;
+    const sev = type === "speed" ? (pen >= PEN_SPEED.major ? "hard" : "med") : sevOf(gDyn);
+    penalty.current += pen != null ? pen : PEN[sev];
+    const ev = { t: (now - startAt.current) / 1000, g: gDyn, sev, type: type || "jolt" };
+    eventsRef.current = [...eventsRef.current, ev];
+    setEvents((e) => [ev, ...e].slice(0, 40));
+  }, []);
+
+  const detachSensors = useCallback(() => {
+    try { cleanupRef.current(); } catch (e) {}
+    cleanupRef.current = () => {};
+    sensorsOn.current = false;
+  }, []);
+
+  // ---------- capteurs réels (attache idempotente) ----------
+  const attachSensors = useCallback(async (scoring) => {
+    if (sensorsOn.current) return true; // déjà attachés (veille) → ne pas doubler
+    gotReading.current = false;
+    try {
+      if (typeof DeviceMotionEvent !== "undefined" &&
+          typeof DeviceMotionEvent.requestPermission === "function") {
+        const res = await DeviceMotionEvent.requestPermission();
+        if (res !== "granted") { setHint("Permission capteurs refusée. Lance une démo à la place."); return false; }
+      }
+    } catch (e) { setHint("Capteurs inaccessibles ici. Lance une démo, ou ouvre la page sur ton téléphone."); return false; }
+
+    const onMotion = (e) => {
+      const now = Date.now();
+      const dt = lastTick.current ? now - lastTick.current : 16;
+      lastTick.current = now;
+      // --- stabilité (gyroscope) ---
+      const r = e.rotationRate;
+      if (r && r.alpha != null) {
+        const rot = Math.sqrt(r.alpha ** 2 + r.beta ** 2 + r.gamma ** 2);
+        rotEma.current += 0.15 * (rot - rotEma.current);
+        if (stable.current && rotEma.current > ROT_UNSTABLE) { stable.current = false; stableSince.current = 0; }
+        else if (!stable.current) {
+          unstableMs.current += dt;
+          if (rotEma.current < ROT_STABLE) {
+            stableSince.current += dt;
+            if (stableSince.current >= STABLE_DELAY) { stable.current = true; grav.current.set = false; } // re-calibre la gravité
+          } else stableSince.current = 0;
+        }
+      }
+      const a = e.accelerationIncludingGravity || e.acceleration;
+      if (!a || a.x == null) return;
+      gotReading.current = true;
+      const gv = grav.current;
+      if (!gv.set) { gv.x = a.x; gv.y = a.y; gv.z = a.z; gv.set = true; }
+      else { const al = 0.02; gv.x += al * (a.x - gv.x); gv.y += al * (a.y - gv.y); gv.z += al * (a.z - gv.z); }
+      const dx = a.x - gv.x, dy = a.y - gv.y, dz = a.z - gv.z;
+      const gn = Math.sqrt(gv.x ** 2 + gv.y ** 2 + gv.z ** 2) || 1;
+      const ux = gv.x / gn, uy = gv.y / gn, uz = gv.z / gn;
+      const dot = dx * ux + dy * uy + dz * uz;
+      const hx = dx - dot * ux, hy = dy - dot * uy, hz = dz - dot * uz;
+      const hMag = Math.sqrt(hx ** 2 + hy ** 2 + hz ** 2) / G;
+      gNow.current = { x: hx / G, y: hz / G, mag: stable.current ? hMag : 0 };
+      if (!scoring() || !stable.current) return; // téléphone manipulé → rien ne compte
+      const f = fwd.current;
+      if (!f.locked && hMag > FWD.min && hMag < FWD.max) {
+        f.x += hx / G; f.y += hy / G; f.z += hz / G; f.acc += hMag;
+        if (f.acc >= FWD.need) { const n = Math.hypot(f.x, f.y, f.z) || 1; f.x /= n; f.y /= n; f.z /= n; f.locked = true; }
+      }
+      if (hMag >= TH.light) {
+        let type = "jolt";
+        if (f.locked) {
+          const lon = (hx / G) * f.x + (hy / G) * f.y + (hz / G) * f.z;
+          const lat = Math.sqrt(Math.max(hMag ** 2 - lon ** 2, 0));
+          type = Math.abs(lon) >= lat ? (lon < 0 ? "brake" : "accel") : "turn";
+        }
+        registerEvent(hMag, type);
+      }
+    };
+    window.addEventListener("devicemotion", onMotion);
+
+    let watchId = null;
+    if (navigator.geolocation) {
+      watchId = navigator.geolocation.watchPosition(async (pos) => {
+        const kmh = pos.coords.speed != null && pos.coords.speed >= 0 ? pos.coords.speed * 3.6 : speedRef.current;
+        speedRef.current = kmh;
+        const p = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+        // --- détection auto (jamais pendant qu'un trajet attend son rôle) ---
+        const A = autoState.current, now = Date.now();
+        if (!running.current && armedRef.current && !pendingRef.current) {
+          if (kmh >= AUTO.startKmh) { if (!A.overSince) A.overSince = now;
+            if (now - A.overSince >= AUTO.startMs) { A.overSince = 0; beginTripRef.current("live", true); } }
+          else A.overSince = 0;
+        } else if (running.current) {
+          if (kmh <= AUTO.stopKmh) { if (!A.underSince) A.underSince = now;
+            if (autoStartedRef.current && now - A.underSince >= AUTO.stopMs) { A.underSince = 0; endTripRef.current(); } }
+          else A.underSince = 0;
+        }
+        if (!running.current) { lastPos.current = p; return; }
+        if (lastPos.current) { const d = haversine(lastPos.current, p); if (d > 2 && d < 500) distRef.current += d; }
+        lastPos.current = p;
+        pathRef.current.push({ lat: p.lat, lon: p.lon, t: (now - startAt.current) / 1000 });
+        if (pathRef.current.length > 900) pathRef.current = pathRef.current.filter((_, i) => i % 2 === 0);
+        // --- limites de vitesse (au plus 1 requête / 20 s) ---
+        if (now - lastLimitFetch.current > 20000) {
+          lastLimitFetch.current = now;
+          fetchSpeedLimit(p.lat, p.lon).then((l) => { if (l) limitRef.current = l; });
+        }
+        const lim = limitRef.current;
+        if (lim && kmh > lim + OVERSPEED_TOL) {
+          if (!overSince.current) overSince.current = now;
+          if (now - overSince.current >= OVERSPEED_SUSTAIN) {
+            overSince.current = now + 15000; // anti-spam : 15 s avant le prochain
+            const excess = kmh - lim;
+            registerEvent(0, "speed", excess >= 15 ? PEN_SPEED.major : PEN_SPEED.minor);
+          }
+        } else overSince.current = 0;
+      }, () => {}, { enableHighAccuracy: true, maximumAge: 1000 });
+    }
+    sensorsOn.current = true;
+    cleanupRef.current = () => {
+      window.removeEventListener("devicemotion", onMotion);
+      if (watchId != null) navigator.geolocation.clearWatch(watchId);
+    };
+    setTimeout(() => {
+      if (!gotReading.current && (running.current || armedRef.current))
+        setHint("Aucune donnée capteur ici. Vérifie que la page est en HTTPS et ouverte sur un téléphone, ou lance une démo.");
+    }, 3000);
+    return true;
+  }, [registerEvent]);
+
+  // ---------- démo (n'écrase plus le cleanup des capteurs) ----------
+  const startDemo = useCallback(() => {
+    let phase = 0, lat = 48.54, lon = 2.66, heading = 0;
+    fwd.current.locked = true;
+    limitRef.current = 50;
+    demoTimer.current = setInterval(() => {
+      phase += 0.08;
+      const ambX = Math.sin(phase * 1.3) * 0.12, ambY = Math.cos(phase) * 0.09;
+      gNow.current = { x: ambX, y: ambY, mag: Math.hypot(ambX, ambY) };
+      speedRef.current = Math.max(0, 42 + Math.sin(phase * 0.4) * 26 + (Math.random() - 0.5) * 4);
+      distRef.current += (speedRef.current / 3.6) * 0.08;
+      heading += (Math.random() - 0.5) * 0.25;
+      lat += Math.cos(heading) * 0.00006; lon += Math.sin(heading) * 0.00009;
+      pathRef.current.push({ lat, lon, t: (Date.now() - startAt.current) / 1000 });
+      if (Math.random() < 0.012) limitRef.current = [50, 80, 110][Math.floor(Math.random() * 3)];
+      if (Math.random() < 0.05) {
+        const g = 0.3 + Math.random() * 0.5;
+        const types = ["brake", "brake", "accel", "turn"];
+        registerEvent(g, types[Math.floor(Math.random() * types.length)]);
+      }
+      if (Math.random() < 0.012)
+        registerEvent(0, "speed", Math.random() < 0.5 ? PEN_SPEED.minor : PEN_SPEED.major);
+      if (Math.random() < 0.01) { // instabilité simulée
+        stable.current = false;
+        setTimeout(() => { stable.current = true; }, 2500);
+        unstableMs.current += 2500;
+      }
+    }, 80);
+  }, [registerEvent]);
+
+  const disarm = useCallback(() => {
+    setArmed(false); armedRef.current = false; setHint("");
+    if (!running.current) { detachSensors(); releaseWake(); }
+  }, [detachSensors, releaseWake]);
+
+  // ---------- cycle de trajet ----------
+  const beginTrip = useCallback(async (which, auto) => {
+    if (which === "demo" && armedRef.current) disarm(); // la démo désarme la veille proprement
+    running.current = true;
+    autoStartedRef.current = !!auto;
+    startAt.current = Date.now();
+    penalty.current = 0; eventsRef.current = []; lastEvAt.current = 0;
+    grav.current = { x: 0, y: 0, z: 0, set: false };
+    fwd.current = { x: 0, y: 0, z: 0, acc: 0, locked: false };
+    gNow.current = { x: 0, y: 0, mag: 0 };
+    rotEma.current = 0; stable.current = true; unstableMs.current = 0;
+    speedRef.current = 0; distRef.current = 0; lastPos.current = null;
+    pathRef.current = []; limitRef.current = null; overSince.current = 0;
+    setEvents([]); setHint(""); setMode(which);
+    setUi({ ...initUi(), cal: which === "demo" });
+    setScreen("drive");
+    if (which === "demo") { startDemo(); return; }
+    const wl = await acquireWake();
+    if (!wl) setHint("Écran non maintenu allumé (wake lock indisponible) : désactive le verrouillage auto du téléphone pour ce trajet.");
+    if (!auto) { // si auto : capteurs déjà attachés par la veille (et attachSensors est idempotent)
+      const ok = await attachSensors(() => running.current);
+      if (!ok) running.current = false;
+    }
+  }, [attachSensors, startDemo, acquireWake, disarm]);
+  useEffect(() => { beginTripRef.current = beginTrip; }, [beginTrip]);
+
+  const armStandby = useCallback(async () => {
+    setArmed(true); armedRef.current = true;
+    const ok = await attachSensors(() => running.current);
+    if (!ok) { setArmed(false); armedRef.current = false; return; }
+    const wl = await acquireWake();
+    setHint(wl
+      ? "Veille active : le trajet démarrera seul dès que tu rouleras. L'écran restera allumé."
+      : "Veille active — mais l'écran ne peut pas être maintenu allumé ici : désactive le verrouillage auto du téléphone, sinon la collecte s'arrêtera au premier verrouillage.");
+  }, [attachSensors, acquireWake]);
+
+  const endTrip = useCallback(() => {
+    running.current = false;
+    if (demoTimer.current) { clearInterval(demoTimer.current); demoTimer.current = null; }
+    if (!armedRef.current) { detachSensors(); releaseWake(); } // veille armée → on garde tout pour le trajet suivant
+    const durationSec = Math.round((Date.now() - startAt.current) / 1000);
+    if (mode !== "demo" && durationSec < MIN_TRIP_SEC && !eventsRef.current.length && distRef.current < 50) {
+      setScreen("home"); setHint("Trajet trop court — ignoré."); return;
+    }
+    const trip = {
+      id: Date.now(), date: new Date().toISOString(),
+      score: Math.max(0, Math.round(100 - penalty.current)),
+      durationSec,
+      distanceKm: Math.round(distRef.current / 100) / 10,
+      events: eventsRef.current,
+      path: compressPath(pathRef.current),
+      unstableSec: Math.round(unstableMs.current / 1000),
+      mode,
+    };
+    setPending(trip);
+    setScreen("role");
+  }, [mode, detachSensors, releaseWake]);
+  useEffect(() => { endTripRef.current = endTrip; }, [endTrip]);
+
+  const confirmRole = useCallback(async (role) => {
+    const trip = { ...pending, role };
+    const prevHash = trips.length ? trips[0].hash : "genesis";
+    await sealTrip(trip, prevHash);
+    const next = [trip, ...trips]; // pas de troncature : la chaîne reste ancrée sur genesis
+    setTrips(next);
+    if (storageOk) await saveTrips(next);
+    await storageDriver.del(DRAFT_KEY);
+    setChainOk(await verifyChain(next));
+    setPending(null); setSummary(trip); setScreen("summary");
+  }, [pending, trips, storageOk]);
+
+  const discardPending = useCallback(async () => {
+    await storageDriver.del(DRAFT_KEY);
+    setPending(null); setScreen("home");
+  }, []);
+
+  useEffect(() => () => {
+    try { cleanupRef.current(); } catch (e) {}
+    if (demoTimer.current) clearInterval(demoTimer.current);
+    releaseWake();
+  }, [releaseWake]);
+
+  const exportData = useCallback(() => {
+    const blob = new Blob([JSON.stringify(trips, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "trace-donnees.json"; a.click();
+    URL.revokeObjectURL(url);
+  }, [trips]);
+
+  return (
+    <div className="ds-root">
+      {screen === "home" && (
+        <Home trips={trips} storageOk={storageOk} armed={armed} hint={hint} chainOk={chainOk}
+          onLive={() => beginTrip("live", false)} onDemo={() => beginTrip("demo", false)}
+          onArm={armStandby} onDisarm={disarm} onPassport={() => setScreen("passport")} />
+      )}
+      {screen === "drive" && (
+        <Drive ui={ui} events={events} hint={hint} onEnd={endTrip} mode={mode} />
+      )}
+      {screen === "role" && pending && (
+        <RoleAsk trip={pending} onPick={confirmRole} onDiscard={discardPending} />
+      )}
+      {screen === "summary" && summary && (
+        <Summary trip={summary} trips={trips} onAgain={() => beginTrip(summary.mode, false)}
+          onPassport={() => setScreen("passport")} onHome={() => setScreen("home")} />
+      )}
+      {screen === "passport" && (
+        <Passport trips={trips} chainOk={chainOk} onHome={() => setScreen("home")} onExport={exportData} />
+      )}
+    </div>
+  );
+}
+
+// ---------------- HOME ----------------
+function Home({ trips, storageOk, armed, hint, chainOk, onLive, onDemo, onArm, onDisarm, onPassport }) {
+  const driver = trips.filter((t) => t.role !== "passenger");
+  const avg = driver.length ? Math.round(driver.reduce((s, t) => s + t.score, 0) / driver.length) : null;
+  return (
+    <div className="ds-home">
+      <header className="ds-head">
+        <span className="ds-mark">TRACÉ</span>
+        <span className="ds-tag">v3c · build collecte</span>
+      </header>
+      <div className="ds-pitch">
+        <h1>Chaque trajet<br />construit ta preuve.</h1>
+        <p>
+          Écran maintenu allumé, trajet sauvegardé toutes les 30 s même en cas
+          de crash, chaîne d'intégrité scellant chaque détail : ce build est
+          fait pour collecter du réel.
+        </p>
+      </div>
+      <div className="ds-cta">
+        {!armed ? (
+          <button className="ds-btn ds-btn-primary" onClick={onArm}>Activer la veille auto</button>
+        ) : (
+          <button className="ds-btn ds-btn-armed" onClick={onDisarm}>
+            <span className="ds-pulse demo" /> Veille active — toucher pour couper
+          </button>
+        )}
+        <button className="ds-btn ds-btn-ghost" onClick={onLive}>Démarrer manuellement</button>
+        <button className="ds-btn ds-btn-ghost" onClick={onDemo}>Voir une démo</button>
+        {trips.length > 0 && (
+          <button className="ds-btn ds-btn-passport" onClick={onPassport}>
+            Ouvrir mon passeport{avg != null ? ` · ${avg}` : ""}
+          </button>
+        )}
+        {hint && <p className="ds-fine ds-finewarn">{hint}</p>}
+        <p className="ds-fine">
+          La veille lance et termine les trajets toute seule tant que la page
+          reste ouverte. Un trajet interrompu (crash, refresh) est récupéré au
+          prochain lancement.
+        </p>
+      </div>
+      {trips.length > 0 ? (
+        <section className="ds-history">
+          <div className="ds-history-top">
+            <span className="ds-hlabel">Derniers trajets</span>
+            <span className="ds-avg">
+              {chainOk === false ? <b className="tone-bad">chaîne rompue</b> : <>moyenne <b>{avg != null ? avg : "—"}</b></>}
+            </span>
+          </div>
+          <Spark trips={driver} />
+          <div className="ds-triplist">
+            {trips.slice(0, 6).map((t) => {
+              const g = gradeOf(t.score);
+              const isP = t.role === "passenger";
+              return (
+                <div className={"ds-triprow" + (isP ? " passenger" : "")} key={t.id}>
+                  <span className={"ds-dot " + (isP ? "off" : g.tone)} />
+                  <span className="ds-tripscore">{isP ? "—" : t.score}</span>
+                  <span className="ds-tripmeta">
+                    {isP ? "passager · exclu" : `${fmtDur(t.durationSec)}${t.distanceKm ? ` · ${t.distanceKm} km` : ""} · ${t.events.length} évts`}
+                    {t.mode === "demo" ? " · démo" : ""}{t.recovered ? " · récupéré" : ""}
+                  </span>
+                  <span className="ds-tripdate">
+                    {new Date(t.date).toLocaleDateString("fr-FR", { day: "2-digit", month: "short" })}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      ) : (
+        <section className="ds-history ds-empty">
+          Aucun trajet. Active la veille, pose le téléphone, roule.
+          {!storageOk && <span className="ds-note">(Stockage indisponible ici : l'historique ne survivra pas à un rechargement.)</span>}
+        </section>
+      )}
+    </div>
+  );
+}
+
+// ---------------- DRIVE (HUD) ----------------
+function Drive({ ui, events, hint, onEnd, mode }) {
+  const g = gradeOf(ui.score);
+  const R = 92, C = 2 * Math.PI * R;
+  const dash = C * (ui.score / 100);
+  const meterR = 66;
+  const mag = Math.min(ui.gMag, 1);
+  const px = Math.max(-1, Math.min(1, ui.gx)) * meterR;
+  const py = Math.max(-1, Math.min(1, ui.gy)) * meterR;
+  const dotTone = ui.gMag >= TH.hard ? "bad" : ui.gMag >= TH.light ? "warn" : "good";
+  const over = ui.limit && ui.speed > ui.limit + OVERSPEED_TOL;
+
+  return (
+    <div className="ds-drive">
+      <header className="ds-drivetop">
+        <button className="ds-end" onClick={onEnd}>Terminer</button>
+        <span className="ds-caltag">
+          {!ui.stable ? "téléphone instable · pause" : ui.cal ? "calibré" : "calibration…"}
+        </span>
+        <span className="ds-livetag">
+          <span className={"ds-pulse " + (mode === "demo" ? "demo" : "")} />
+          {mode === "demo" ? "démo" : "direct"}
+        </span>
+      </header>
+
+      <div className="ds-hud">
+        <div className={"ds-hud-speed" + (over ? " over" : "")}>
+          <span className="ds-hud-val">{Math.round(ui.speed)}</span>
+          <span className="ds-hud-unit">km/h</span>
+        </div>
+        {ui.limit != null && (
+          <div className={"ds-sign" + (over ? " over" : "")}>
+            <span>{ui.limit}</span>
+          </div>
+        )}
+      </div>
+
+      <div className={"ds-gauge" + (!ui.stable ? " frozen" : "")}>
+        <svg viewBox="0 0 220 220" className="ds-gsvg">
+          <circle cx="110" cy="110" r={R} className="ds-ring-bg" />
+          <circle cx="110" cy="110" r={R} className={"ds-ring-fg tone-" + g.tone}
+            strokeDasharray={`${dash} ${C}`} transform="rotate(-90 110 110)" />
+          <circle cx="110" cy="110" r={meterR} className="ds-meter-ring" />
+          <line x1="110" y1={110 - meterR} x2="110" y2={110 + meterR} className="ds-cross" />
+          <line x1={110 - meterR} y1="110" x2={110 + meterR} y2="110" className="ds-cross" />
+          <circle cx="110" cy="110" r={meterR * 0.5} className="ds-meter-inner" />
+          <circle cx={110 + px} cy={110 + py} r={7 + mag * 6} className={"ds-gdot tone-" + dotTone} />
+        </svg>
+        <div className="ds-gauge-center">
+          <span className="ds-score">{ui.score}</span>
+          <span className={"ds-grade tone-" + g.tone}>{!ui.stable ? "en pause" : g.label}</span>
+        </div>
+      </div>
+
+      <div className="ds-readout">
+        <div className="ds-metric"><span className="ds-mval">{fmtDur(ui.elapsed)}</span><span className="ds-mlabel">durée</span></div>
+        <div className="ds-metric"><span className="ds-mval">{ui.gMag.toFixed(2)}</span><span className="ds-mlabel">force g</span></div>
+        <div className="ds-metric"><span className="ds-mval">{ui.count}</span><span className="ds-mlabel">évts</span></div>
+        <div className="ds-metric"><span className="ds-mval">{ui.unstableSec}s</span><span className="ds-mlabel">instable</span></div>
+      </div>
+
+      {hint && <div className="ds-hint">{hint}</div>}
+
+      <div className="ds-log">
+        {events.length === 0 && !hint && (
+          <div className="ds-logempty">Conduis. Chaque événement s'affichera ici, typé et daté.</div>
+        )}
+        {events.map((e, i) => (
+          <div className={"ds-logrow sev-" + e.sev} key={i}>
+            <span className="ds-logsev">{TYPE_LABEL[e.type || "jolt"]}</span>
+            {e.type !== "speed" && <span className="ds-logg">{e.g.toFixed(2)} g</span>}
+            <span className="ds-logt">{fmtT(e.t)}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---------------- RÔLE ----------------
+function RoleAsk({ trip, onPick, onDiscard }) {
+  return (
+    <div className="ds-roleask">
+      <header className="ds-head">
+        <span className="ds-mark">TRACÉ</span>
+        <span className="ds-tag">{trip.recovered ? "trajet récupéré" : "fin de trajet"}</span>
+      </header>
+      <div className="ds-role-body">
+        <h2>Qui conduisait ?</h2>
+        {trip.recovered && (
+          <p className="ds-finewarn" style={{ margin: 0, fontSize: 13 }}>
+            Ce trajet a été interrompu (page fermée ou crash) et récupéré depuis
+            la dernière sauvegarde — les dernières secondes peuvent manquer.
+          </p>
+        )}
+        <p>
+          {fmtDur(trip.durationSec)} de trajet{trip.distanceKm ? `, ${trip.distanceKm} km` : ""}.
+          Seuls tes trajets en tant que conducteur comptent dans ton passeport —
+          l'honnêteté ici, c'est ce qui donne sa valeur à ta preuve.
+        </p>
+        <button className="ds-btn ds-btn-primary" onClick={() => onPick("driver")}>
+          Je conduisais
+        </button>
+        <button className="ds-btn ds-btn-ghost" onClick={() => onPick("passenger")}>
+          J'étais passager — exclure ce trajet
+        </button>
+        {trip.recovered && (
+          <button className="ds-btn ds-btn-ghost" onClick={onDiscard}>
+            Jeter ce trajet (incomplet)
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------- SUMMARY ----------------
+function Summary({ trip, trips, onAgain, onPassport, onHome }) {
+  const g = gradeOf(trip.score);
+  const c = { brake: 0, accel: 0, turn: 0, jolt: 0, speed: 0 };
+  (trip.events || []).forEach((e) => c[e.type || "jolt"]++);
+  const lines = trip.role === "passenger" ? [] : coachLines(trip.events || []);
+  const driver = trips.filter((t) => t.role !== "passenger");
+  return (
+    <div className="ds-summary">
+      <header className="ds-head">
+        <span className="ds-mark">TRACÉ</span>
+        <span className="ds-tag">bilan du trajet</span>
+      </header>
+      {trip.role === "passenger" ? (
+        <div className="ds-coach"><span className="ds-coach-h">Trajet passager</span>
+          <p className="ds-coach-line">Enregistré mais exclu de ton passeport. Ta preuve reste propre.</p>
+        </div>
+      ) : (
+        <>
+          <div className="ds-finalscore">
+            <span className={"ds-bigscore tone-" + g.tone}>{trip.score}</span>
+            <span className={"ds-grade big tone-" + g.tone}>{g.label}</span>
+            <span className="ds-tripsub">
+              {fmtDur(trip.durationSec)}{trip.distanceKm ? ` · ${trip.distanceKm} km` : ""}
+              {trip.unstableSec ? ` · ${trip.unstableSec}s instable ignorées` : ""}
+            </span>
+          </div>
+          {trip.path && trip.path.length > 4 && <RouteTrace trip={trip} />}
+          <div className="ds-breakdown">
+            <div className="ds-bk"><span className="ds-bkn tone-bad">{c.brake}</span><span className="ds-bkl">frein.</span></div>
+            <div className="ds-bk"><span className="ds-bkn tone-warn">{c.accel}</span><span className="ds-bkl">accél.</span></div>
+            <div className="ds-bk"><span className="ds-bkn tone-warn">{c.turn}</span><span className="ds-bkl">virages</span></div>
+            <div className="ds-bk"><span className="ds-bkn tone-bad">{c.speed}</span><span className="ds-bkl">vitesse</span></div>
+          </div>
+          <div className="ds-coach">
+            <span className="ds-coach-h">Pour monter ton score</span>
+            {lines.map((l, i) => <p key={i} className="ds-coach-line">{l}</p>)}
+          </div>
+        </>
+      )}
+      {driver.length > 1 && (
+        <div className="ds-progress"><span className="ds-hlabel">Ta progression</span><Spark trips={driver} /></div>
+      )}
+      <div className="ds-cta">
+        <button className="ds-btn ds-btn-primary" onClick={onAgain}>Refaire un trajet</button>
+        <button className="ds-btn ds-btn-passport" onClick={onPassport}>Voir mon passeport</button>
+        <button className="ds-btn ds-btn-ghost" onClick={onHome}>Retour</button>
+      </div>
+    </div>
+  );
+}
+
+// ---------------- TRACÉ DU TRAJET ----------------
+function RouteTrace({ trip }) {
+  const pts = trip.path; // [lat, lon, t]
+  const lats = pts.map((p) => p[0]), lons = pts.map((p) => p[1]);
+  const minLa = Math.min(...lats), maxLa = Math.max(...lats);
+  const minLo = Math.min(...lons), maxLo = Math.max(...lons);
+  const W = 320, H = 150, pad = 14;
+  const sx = (lo) => pad + ((lo - minLo) / Math.max(maxLo - minLo, 1e-6)) * (W - pad * 2);
+  const sy = (la) => H - pad - ((la - minLa) / Math.max(maxLa - minLa, 1e-6)) * (H - pad * 2);
+  const d = pts.map((p, i) => `${i ? "L" : "M"}${sx(p[1]).toFixed(1)},${sy(p[0]).toFixed(1)}`).join(" ");
+  const evPts = (trip.events || []).map((e) => {
+    let best = pts[0], bd = Infinity;
+    for (const p of pts) { const dd = Math.abs(p[2] - e.t); if (dd < bd) { bd = dd; best = p; } }
+    return { x: sx(best[1]), y: sy(best[0]), sev: e.sev, type: e.type };
+  });
+  return (
+    <div className="ds-route">
+      <span className="ds-hlabel">Le tracé</span>
+      <svg viewBox={`0 0 ${W} ${H}`} className="ds-route-svg">
+        <path d={d} className="ds-route-line" />
+        <circle cx={sx(pts[0][1])} cy={sy(pts[0][0])} r="4" className="ds-route-start" />
+        {evPts.map((p, i) => (
+          <circle key={i} cx={p.x} cy={p.y} r={p.sev === "hard" ? 4.5 : 3.5}
+            className={"ds-route-ev " + (p.sev === "hard" ? "bad" : "warn")} />
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+// ---------------- PASSPORT ----------------
+function Passport({ trips, chainOk, onHome, onExport }) {
+  const real = trips.filter((t) => t.role !== "passenger");
+  const n = real.length;
+  const avg = n ? Math.round(real.reduce((s, t) => s + t.score, 0) / n) : 0;
+  const g = gradeOf(avg);
+  const totalSec = real.reduce((s, t) => s + t.durationSec, 0);
+  const totalKm = Math.round(real.reduce((s, t) => s + (t.distanceKm || 0), 0) * 10) / 10;
+  const allEv = real.flatMap((t) => t.events || []);
+  const c = { brake: 0, accel: 0, turn: 0, jolt: 0, speed: 0 };
+  allEv.forEach((e) => c[e.type || "jolt"]++);
+  const hours = Math.max(totalSec / 3600, 1 / 60);
+  const evPerH = Math.round((allEv.length / hours) * 10) / 10;
+  const last5 = real.slice(0, 5), prev5 = real.slice(5, 10);
+  const trend = last5.length && prev5.length
+    ? Math.round(last5.reduce((s, t) => s + t.score, 0) / last5.length) -
+      Math.round(prev5.reduce((s, t) => s + t.score, 0) / prev5.length)
+    : null;
+
+  return (
+    <div className="ds-passport">
+      <header className="ds-head">
+        <span className="ds-mark">TRACÉ</span>
+        <span className="ds-tag">passeport conducteur</span>
+      </header>
+      {n === 0 ? (
+        <div className="ds-pass-empty">
+          Ton passeport est vide. Roule un premier trajet en conducteur : chaque
+          kilomètre devient une ligne de ta preuve.
+          <button className="ds-btn ds-btn-ghost" onClick={onHome}>Retour</button>
+        </div>
+      ) : (
+        <>
+          <div className="ds-card">
+            <div className="ds-card-top">
+              <div className="ds-seal">
+                <svg viewBox="0 0 120 120">
+                  <circle cx="60" cy="60" r="54" className={"ds-seal-ring tone-" + g.tone} />
+                  <circle cx="60" cy="60" r="46" className="ds-seal-inner" />
+                </svg>
+                <div className="ds-seal-center">
+                  <span className={"ds-seal-score tone-" + g.tone}>{avg}</span>
+                </div>
+              </div>
+              <div className="ds-card-id">
+                <span className={"ds-card-grade tone-" + g.tone}>{g.label}</span>
+                <span className="ds-card-line">{n} trajet{n > 1 ? "s" : ""} conducteur</span>
+                <span className="ds-card-line">{fmtDur(totalSec)} de conduite{totalKm ? ` · ${totalKm} km` : ""}</span>
+                {trend != null && (
+                  <span className={"ds-card-line " + (trend >= 0 ? "tone-good" : "tone-bad")}>
+                    tendance {trend >= 0 ? "+" : ""}{trend} pts (5 derniers)
+                  </span>
+                )}
+              </div>
+            </div>
+            <div className="ds-card-stats">
+              <div className="ds-cs"><span className="ds-cs-n">{evPerH}</span><span className="ds-cs-l">évts/h</span></div>
+              <div className="ds-cs"><span className="ds-cs-n tone-bad">{c.brake}</span><span className="ds-cs-l">frein.</span></div>
+              <div className="ds-cs"><span className="ds-cs-n tone-bad">{c.speed}</span><span className="ds-cs-l">vitesse</span></div>
+              <div className="ds-cs"><span className="ds-cs-n tone-warn">{c.turn}</span><span className="ds-cs-l">virages</span></div>
+            </div>
+            {!HASH_OK ? (
+              <div className="ds-chain warn">
+                Chaîne d'intégrité inactive ici — ouvre la page en HTTPS pour que les trajets soient scellés.
+              </div>
+            ) : (
+              <div className={"ds-chain " + (chainOk === false ? "bad" : "ok")}>
+                {chainOk === false
+                  ? "⚠ Chaîne d'intégrité rompue — des trajets ont été modifiés ou supprimés."
+                  : "Chaîne d'intégrité vérifiée — aucun trajet modifié ni supprimé."}
+              </div>
+            )}
+            <p className="ds-card-foot">
+              Prototype — non certifié. La version finale ajoute l'horodatage
+              serveur et la détection en arrière-plan pour rendre la preuve opposable.
+            </p>
+          </div>
+          <div className="ds-progress ds-pass-spark">
+            <span className="ds-hlabel">Historique des scores</span>
+            <Spark trips={real} />
+          </div>
+          <div className="ds-cta">
+            <button className="ds-btn ds-btn-ghost" onClick={onExport}>Exporter mes données (JSON)</button>
+            <button className="ds-btn ds-btn-ghost" onClick={onHome}>Retour</button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---------------- sparkline ----------------
+function Spark({ trips }) {
+  const data = [...trips].reverse().map((t) => t.score);
+  if (data.length < 2)
+    return <div className="ds-sparkempty">Au moins deux trajets pour voir la courbe.</div>;
+  const W = 320, H = 64, pad = 8;
+  const min = Math.min(...data, 40), max = 100;
+  const stepX = (W - pad * 2) / (data.length - 1);
+  const pts = data.map((v, i) => [pad + i * stepX, pad + (1 - (v - min) / (max - min)) * (H - pad * 2)]);
+  const d = pts.map((p, i) => (i === 0 ? `M${p[0]},${p[1]}` : `L${p[0]},${p[1]}`)).join(" ");
+  const area = `${d} L${pts[pts.length - 1][0]},${H - pad} L${pts[0][0]},${H - pad} Z`;
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="ds-spark" preserveAspectRatio="none">
+      <path d={area} className="ds-spark-area" />
+      <path d={d} className="ds-spark-line" />
+      {pts.map((p, i) => <circle key={i} cx={p[0]} cy={p[1]} r="2.5" className="ds-spark-pt" />)}
+    </svg>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<TraceCollect />);
+</script>
+</body>
+</html>
