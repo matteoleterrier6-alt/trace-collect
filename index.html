@@ -32,6 +32,12 @@ Fixes vs v3 (artifact) :
     pénalités ramenées à 100 km puis converties en 0-100 (voir
     RATE dans PARAMÈTRES). Un long trajet souple score aussi
     haut ou plus haut qu'un trajet court. TH/PEN inchangés.
+ 8. Chocs de route filtrés : chaque candidat est observé pendant
+    ROAD.windowMs ; si le pic vertical (le long de la gravité)
+    domine le pic horizontal ET que l'horizontal retombe en moins
+    de ROAD.maxMs, l'événement est classé « route dégradée » —
+    loggé, visible sur le tracé, mais JAMAIS pénalisé. Seuls les
+    événements horizontaux (freinage/accél/virage) pénalisent.
  Divers : trajets < 30 s sans événement ni distance ignorés,
  durées > 1 h lisibles (fmtDur), état "chaîne inactive" affiché
  hors HTTPS.
@@ -245,6 +251,7 @@ const TH = { light: 0.30, med: 0.45, hard: 0.62 };          // seuils d'à-coups
 const PEN = { light: 2, med: 5, hard: 9 };                   // pénalités
 const PEN_SPEED = { minor: 4, major: 10 };                   // excès <15 / >=15 km/h
 const RATE = { cost: 0.5, minKm: 5 };                        // score = 100 − cost × (pénalités/100 km) ; minKm amortit les trajets courts
+const ROAD = { dom: 1.4, maxMs: 150, windowMs: 260 };        // choc de route : |vert| > dom×|horiz| ET horiz élevé < maxMs → non pénalisé ; windowMs = fenêtre d'observation
 const COOLDOWN = 1200;                                       // ms entre événements
 const ROT_UNSTABLE = 60, ROT_STABLE = 25;                    // °/s gyroscope (hystérésis)
 const STABLE_DELAY = 1500;                                   // ms de calme avant reprise
@@ -370,7 +377,7 @@ const gradeOf = (s) =>
   s >= 75 ? { label: "Solide", tone: "good" } :
   s >= 60 ? { label: "Perfectible", tone: "warn" } :
   s >= 40 ? { label: "Brusque", tone: "bad" } : { label: "À risque", tone: "bad" };
-const TYPE_LABEL = { brake: "freinage", accel: "accélération", turn: "virage", jolt: "à-coup", speed: "excès vitesse" };
+const TYPE_LABEL = { brake: "freinage", accel: "accélération", turn: "virage", jolt: "à-coup", speed: "excès vitesse", road: "route dégradée" };
 function haversine(a, b) {
   const R = 6371000, r = Math.PI / 180;
   const dLat = (b.lat - a.lat) * r, dLon = (b.lon - a.lon) * r;
@@ -391,7 +398,7 @@ function draftToTrip(d) {
   };
 }
 function coachLines(events) {
-  const c = { brake: 0, accel: 0, turn: 0, jolt: 0, speed: 0 };
+  const c = { brake: 0, accel: 0, turn: 0, jolt: 0, speed: 0, road: 0 };
   events.forEach((e) => c[e.type || "jolt"]++);
   const out = [];
   if (!events.length) { out.push("Trajet net, zéro événement. Le profil que les assureurs récompensent."); return out; }
@@ -428,6 +435,7 @@ function TraceCollect() {
   const penalty = useRef(0);
   const eventsRef = useRef([]);
   const lastEvAt = useRef(0);
+  const pendingEv = useRef(null); // candidat en observation (fenêtre choc de route)
   const grav = useRef({ x: 0, y: 0, z: 0, set: false });
   const fwd = useRef({ x: 0, y: 0, z: 0, acc: 0, locked: false });
   const gNow = useRef({ x: 0, y: 0, mag: 0 });
@@ -540,7 +548,7 @@ function TraceCollect() {
     const now = Date.now();
     if (type !== "speed" && now - lastEvAt.current < COOLDOWN) return;
     if (type !== "speed") lastEvAt.current = now;
-    const sev = type === "speed" ? (pen >= PEN_SPEED.major ? "hard" : "med") : sevOf(gDyn);
+    const sev = type === "speed" ? (pen >= PEN_SPEED.major ? "hard" : "med") : type === "road" ? "light" : sevOf(gDyn);
     penalty.current += pen != null ? pen : PEN[sev];
     const ev = { t: (now - startAt.current) / 1000, g: gDyn, sev, type: type || "jolt" };
     eventsRef.current = [...eventsRef.current, ev];
@@ -596,20 +604,38 @@ function TraceCollect() {
       const hx = dx - dot * ux, hy = dy - dot * uy, hz = dz - dot * uz;
       const hMag = Math.sqrt(hx ** 2 + hy ** 2 + hz ** 2) / G;
       gNow.current = { x: hx / G, y: hz / G, mag: stable.current ? hMag : 0 };
-      if (!scoring() || !stable.current) return; // téléphone manipulé → rien ne compte
+      if (!scoring() || !stable.current) { pendingEv.current = null; return; } // téléphone manipulé → rien ne compte
       const f = fwd.current;
       if (!f.locked && hMag > FWD.min && hMag < FWD.max) {
         f.x += hx / G; f.y += hy / G; f.z += hz / G; f.acc += hMag;
         if (f.acc >= FWD.need) { const n = Math.hypot(f.x, f.y, f.z) || 1; f.x /= n; f.y /= n; f.z /= n; f.locked = true; }
       }
-      if (hMag >= TH.light) {
-        let type = "jolt";
-        if (f.locked) {
-          const lon = (hx / G) * f.x + (hy / G) * f.y + (hz / G) * f.z;
-          const lat = Math.sqrt(Math.max(hMag ** 2 - lon ** 2, 0));
-          type = Math.abs(lon) >= lat ? (lon < 0 ? "brake" : "accel") : "turn";
+      // Un candidat n'est pas pénalisé à chaud : on l'observe pendant windowMs
+      // pour distinguer un choc de route (pic vertical dominant, très bref) d'une
+      // vraie manœuvre (horizontal soutenu). Seul l'horizontal est pénalisé.
+      const vMag = Math.abs(dot) / G; // composante le long de la gravité
+      const pe = pendingEv.current;
+      if (pe) {
+        if (hMag > pe.peakH) { pe.peakH = hMag; pe.hx = hx; pe.hy = hy; pe.hz = hz; }
+        if (vMag > pe.peakV) pe.peakV = vMag;
+        if (hMag >= TH.light) pe.lastAbove = now;
+        if (now - pe.t0 >= ROAD.windowMs) {
+          pendingEv.current = null;
+          const elevatedMs = pe.lastAbove - pe.t0;
+          if (pe.peakV > ROAD.dom * pe.peakH && elevatedMs <= ROAD.maxMs) {
+            registerEvent(pe.peakH, "road", 0); // choc de route : loggé, zéro pénalité
+          } else {
+            let type = "jolt";
+            if (f.locked) {
+              const lon = (pe.hx / G) * f.x + (pe.hy / G) * f.y + (pe.hz / G) * f.z;
+              const lat = Math.sqrt(Math.max(pe.peakH ** 2 - lon ** 2, 0));
+              type = Math.abs(lon) >= lat ? (lon < 0 ? "brake" : "accel") : "turn";
+            }
+            registerEvent(pe.peakH, type);
+          }
         }
-        registerEvent(hMag, type);
+      } else if (hMag >= TH.light && now - lastEvAt.current >= COOLDOWN) {
+        pendingEv.current = { t0: now, peakH: hMag, peakV: vMag, hx, hy, hz, lastAbove: now };
       }
     };
     window.addEventListener("devicemotion", onMotion);
@@ -686,6 +712,8 @@ function TraceCollect() {
       }
       if (Math.random() < 0.012)
         registerEvent(0, "speed", Math.random() < 0.5 ? PEN_SPEED.minor : PEN_SPEED.major);
+      if (Math.random() < 0.02)
+        registerEvent(0.3 + Math.random() * 0.4, "road", 0); // choc de route simulé, non pénalisé
       if (Math.random() < 0.01) { // instabilité simulée
         stable.current = false;
         setTimeout(() => { stable.current = true; }, 2500);
@@ -705,7 +733,7 @@ function TraceCollect() {
     running.current = true;
     autoStartedRef.current = !!auto;
     startAt.current = Date.now();
-    penalty.current = 0; eventsRef.current = []; lastEvAt.current = 0;
+    penalty.current = 0; eventsRef.current = []; lastEvAt.current = 0; pendingEv.current = null;
     grav.current = { x: 0, y: 0, z: 0, set: false };
     fwd.current = { x: 0, y: 0, z: 0, acc: 0, locked: false };
     gNow.current = { x: 0, y: 0, mag: 0 };
@@ -1011,7 +1039,7 @@ function RoleAsk({ trip, onPick, onDiscard }) {
 // ---------------- SUMMARY ----------------
 function Summary({ trip, trips, onAgain, onPassport, onHome }) {
   const g = gradeOf(trip.score);
-  const c = { brake: 0, accel: 0, turn: 0, jolt: 0, speed: 0 };
+  const c = { brake: 0, accel: 0, turn: 0, jolt: 0, speed: 0, road: 0 };
   (trip.events || []).forEach((e) => c[e.type || "jolt"]++);
   const lines = trip.role === "passenger" ? [] : coachLines(trip.events || []);
   const driver = trips.filter((t) => t.role !== "passenger");
@@ -1099,10 +1127,11 @@ function Passport({ trips, chainOk, onHome, onExport }) {
   const totalSec = real.reduce((s, t) => s + t.durationSec, 0);
   const totalKm = Math.round(real.reduce((s, t) => s + (t.distanceKm || 0), 0) * 10) / 10;
   const allEv = real.flatMap((t) => t.events || []);
-  const c = { brake: 0, accel: 0, turn: 0, jolt: 0, speed: 0 };
+  const c = { brake: 0, accel: 0, turn: 0, jolt: 0, speed: 0, road: 0 };
   allEv.forEach((e) => c[e.type || "jolt"]++);
   const hours = Math.max(totalSec / 3600, 1 / 60);
-  const evPerH = Math.round((allEv.length / hours) * 10) / 10;
+  const penEv = allEv.filter((e) => e.type !== "road"); // les chocs de route ne comptent pas dans le taux
+  const evPerH = Math.round((penEv.length / hours) * 10) / 10;
   const last5 = real.slice(0, 5), prev5 = real.slice(5, 10);
   const trend = last5.length && prev5.length
     ? Math.round(last5.reduce((s, t) => s + t.score, 0) / last5.length) -
