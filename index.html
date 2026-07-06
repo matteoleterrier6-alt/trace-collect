@@ -28,6 +28,10 @@ Fixes vs v3 (artifact) :
  6. Attache capteurs idempotente — veille + démarrage manuel ne
     double plus les listeners ; la démo désarme la veille au lieu
     d'orpheliner son cleanup.
+ 7. Score = taux normalisé et non plus soustraction absolue :
+    pénalités ramenées à 100 km puis converties en 0-100 (voir
+    RATE dans PARAMÈTRES). Un long trajet souple score aussi
+    haut ou plus haut qu'un trajet court. TH/PEN inchangés.
  Divers : trajets < 30 s sans événement ni distance ignorés,
  durées > 1 h lisibles (fmtDur), état "chaîne inactive" affiché
  hors HTTPS.
@@ -240,6 +244,7 @@ const G = 9.81;
 const TH = { light: 0.30, med: 0.45, hard: 0.62 };          // seuils d'à-coups (g)
 const PEN = { light: 2, med: 5, hard: 9 };                   // pénalités
 const PEN_SPEED = { minor: 4, major: 10 };                   // excès <15 / >=15 km/h
+const RATE = { cost: 0.5, minKm: 5 };                        // score = 100 − cost × (pénalités/100 km) ; minKm amortit les trajets courts
 const COOLDOWN = 1200;                                       // ms entre événements
 const ROT_UNSTABLE = 60, ROT_STABLE = 25;                    // °/s gyroscope (hystérésis)
 const STABLE_DELAY = 1500;                                   // ms de calme avant reprise
@@ -350,6 +355,16 @@ const fmtT = (s) => `${Math.floor(s / 60)}:${Math.floor(s % 60).toString().padSt
 const fmtDur = (s) => s >= 3600
   ? `${Math.floor(s / 3600)}h${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}`
   : fmtT(s);
+// Score = taux normalisé, pas une soustraction absolue : les pénalités sont
+// ramenées à 100 km, donc un long trajet souple score aussi haut (ou plus)
+// qu'un trajet court. Le plancher minKm évite la division par ~0 en début de
+// trajet et amortit les trajets très courts — le score « se stabilise » avec
+// les kilomètres.
+function computeScore(penalty, distanceKm) {
+  const effKm = Math.max(distanceKm || 0, RATE.minKm);
+  const per100 = (penalty / effKm) * 100;
+  return Math.max(0, Math.min(100, Math.round(100 - RATE.cost * per100)));
+}
 const gradeOf = (s) =>
   s >= 90 ? { label: "Exemplaire", tone: "good" } :
   s >= 75 ? { label: "Solide", tone: "good" } :
@@ -367,7 +382,7 @@ const compressPath = (pts) => pts.filter((_, i) => i % 3 === 0).map((p) => [
 function draftToTrip(d) {
   return {
     id: d.startAt, date: new Date(d.startAt).toISOString(),
-    score: Math.max(0, Math.round(100 - (d.penalty || 0))),
+    score: computeScore(d.penalty || 0, (d.dist || 0) / 1000),
     durationSec: Math.round((d.savedAt - d.startAt) / 1000),
     distanceKm: Math.round((d.dist || 0) / 100) / 10,
     events: d.events || [], path: d.path || [],
@@ -507,7 +522,7 @@ function TraceCollect() {
     const iv = setInterval(() => {
       if (!running.current) return;
       setUi({
-        score: Math.max(0, Math.round(100 - penalty.current)),
+        score: computeScore(penalty.current, distRef.current / 1000),
         gx: gNow.current.x, gy: gNow.current.y, gMag: gNow.current.mag,
         speed: speedRef.current,
         elapsed: (Date.now() - startAt.current) / 1000,
@@ -730,7 +745,7 @@ function TraceCollect() {
     }
     const trip = {
       id: Date.now(), date: new Date().toISOString(),
-      score: Math.max(0, Math.round(100 - penalty.current)),
+      score: computeScore(penalty.current, distRef.current / 1000),
       durationSec,
       distanceKm: Math.round(distRef.current / 100) / 10,
       events: eventsRef.current,
