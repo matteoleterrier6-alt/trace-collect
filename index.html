@@ -56,6 +56,11 @@ html,body{margin:0;padding:0;background:#0A0F14;}
   font-family:'Space Grotesk',system-ui,sans-serif;
   color:var(--ink); background:var(--bg);
   min-height:100vh; width:100%; -webkit-font-smoothing:antialiased;
+  /* safe areas iOS : la status bar translucide fait passer le contenu dessous */
+  padding-top:max(env(safe-area-inset-top), 8px);
+  padding-bottom:max(env(safe-area-inset-bottom), 0px);
+  padding-left:max(env(safe-area-inset-left), 0px);
+  padding-right:max(env(safe-area-inset-right), 0px);
 }
 .ds-root *{box-sizing:border-box;}
 .ds-root button{font-family:inherit;cursor:pointer;}
