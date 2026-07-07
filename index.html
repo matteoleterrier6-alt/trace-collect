@@ -38,6 +38,11 @@ Fixes vs v3 (artifact) :
     de ROAD.maxMs, l'événement est classé « route dégradée » —
     loggé, visible sur le tracé, mais JAMAIS pénalisé. Seuls les
     événements horizontaux (freinage/accél/virage) pénalisent.
+ 9. Limites absurdes ignorées : si la vitesse soutenue dépasse
+    LIMIT_SANE.factor × la limite annoncée, c'est la base qui a
+    tort — jamais de pénalité dans ce cas, limite retirée du HUD
+    après badMs, et valeur refusée au re-fetch tant que la vitesse
+    reste incompatible (ou distrustMs écoulé).
  Divers : trajets < 30 s sans événement ni distance ignorés,
  durées > 1 h lisibles (fmtDur), état "chaîne inactive" affiché
  hors HTTPS.
@@ -252,6 +257,7 @@ const PEN = { light: 2, med: 5, hard: 9 };                   // pénalités
 const PEN_SPEED = { minor: 4, major: 10 };                   // excès <15 / >=15 km/h
 const RATE = { cost: 0.5, minKm: 5 };                        // score = 100 − cost × (pénalités/100 km) ; minKm amortit les trajets courts
 const ROAD = { dom: 1.4, maxMs: 150, windowMs: 260 };        // choc de route : |vert| > dom×|horiz| ET horiz élevé < maxMs → non pénalisé ; windowMs = fenêtre d'observation
+const LIMIT_SANE = { factor: 1.8, badMs: 15000, distrustMs: 180000, clearFactor: 1.2 }; // limite absurde : vitesse soutenue > factor×limite → limite rejetée, jamais pénalisée ; réhabilitée après distrustMs ou vitesse ≤ clearFactor×limite
 const COOLDOWN = 1200;                                       // ms entre événements
 const ROT_UNSTABLE = 60, ROT_STABLE = 25;                    // °/s gyroscope (hystérésis)
 const STABLE_DELAY = 1500;                                   // ms de calme avant reprise
@@ -451,6 +457,9 @@ function TraceCollect() {
   const limitRef = useRef(null);
   const overSince = useRef(0);
   const lastLimitFetch = useRef(0);
+  const speedEma = useRef(0);          // vitesse lissée (~7 s) pour juger la plausibilité des limites
+  const implausibleSince = useRef(0);  // depuis quand la limite courante est incohérente
+  const distrust = useRef(null);       // { value, until } : valeur de limite écartée, refusée au re-fetch
   const autoState = useRef({ overSince: 0, underSince: 0 });
   const gotReading = useRef(false);
   const cleanupRef = useRef(() => {});
@@ -645,6 +654,7 @@ function TraceCollect() {
       watchId = navigator.geolocation.watchPosition(async (pos) => {
         const kmh = pos.coords.speed != null && pos.coords.speed >= 0 ? pos.coords.speed * 3.6 : speedRef.current;
         speedRef.current = kmh;
+        speedEma.current += 0.15 * (kmh - speedEma.current); // vitesse soutenue (converge en ~7 s)
         const p = { lat: pos.coords.latitude, lon: pos.coords.longitude };
         // --- détection auto (jamais pendant qu'un trajet attend son rôle) ---
         const A = autoState.current, now = Date.now();
@@ -665,15 +675,36 @@ function TraceCollect() {
         // --- limites de vitesse (au plus 1 requête / 20 s) ---
         if (now - lastLimitFetch.current > 20000) {
           lastLimitFetch.current = now;
-          fetchSpeedLimit(p.lat, p.lon).then((l) => { if (l) limitRef.current = l; });
+          fetchSpeedLimit(p.lat, p.lon).then((l) => {
+            if (!l) return;
+            // une valeur écartée reste refusée tant que la vitesse est incompatible
+            if (distrust.current && l === distrust.current.value && Date.now() < distrust.current.until) return;
+            limitRef.current = l;
+          });
         }
+        // --- plausibilité : une limite très en-dessous de la vitesse soutenue est une
+        // erreur de base (mauvaise route OSM matchée), pas un excès du conducteur ---
         const lim = limitRef.current;
-        if (lim && kmh > lim + OVERSPEED_TOL) {
+        if (lim && speedEma.current > lim * LIMIT_SANE.factor) {
+          if (!implausibleSince.current) implausibleSince.current = now;
+          if (now - implausibleSince.current >= LIMIT_SANE.badMs) {
+            distrust.current = { value: lim, until: now + LIMIT_SANE.distrustMs };
+            limitRef.current = null; implausibleSince.current = 0; overSince.current = 0;
+          }
+        } else implausibleSince.current = 0;
+        // réhabilitation : vitesse redevenue compatible avec la valeur écartée, ou délai écoulé
+        const bad = distrust.current;
+        if (bad && (speedEma.current <= bad.value * LIMIT_SANE.clearFactor || now >= bad.until)) distrust.current = null;
+        const lim2 = limitRef.current;
+        if (lim2 && kmh > lim2 + OVERSPEED_TOL) {
           if (!overSince.current) overSince.current = now;
           if (now - overSince.current >= OVERSPEED_SUSTAIN) {
-            overSince.current = now + 15000; // anti-spam : 15 s avant le prochain
-            const excess = kmh - lim;
-            registerEvent(0, "speed", excess >= 15 ? PEN_SPEED.major : PEN_SPEED.minor);
+            // jamais de pénalité quand la vitesse elle-même rend la limite implausible
+            if (kmh < lim2 * LIMIT_SANE.factor) {
+              overSince.current = now + 15000; // anti-spam : 15 s avant le prochain
+              const excess = kmh - lim2;
+              registerEvent(0, "speed", excess >= 15 ? PEN_SPEED.major : PEN_SPEED.minor);
+            }
           }
         } else overSince.current = 0;
       }, () => {}, { enableHighAccuracy: true, maximumAge: 1000 });
@@ -740,6 +771,7 @@ function TraceCollect() {
     rotEma.current = 0; stable.current = true; unstableMs.current = 0;
     speedRef.current = 0; distRef.current = 0; lastPos.current = null;
     pathRef.current = []; limitRef.current = null; overSince.current = 0;
+    speedEma.current = 0; implausibleSince.current = 0; distrust.current = null;
     setEvents([]); setHint(""); setMode(which);
     setUi({ ...initUi(), cal: which === "demo" });
     setScreen("drive");
