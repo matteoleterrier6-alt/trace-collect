@@ -43,6 +43,11 @@ Fixes vs v3 (artifact) :
     tort — jamais de pénalité dans ce cas, limite retirée du HUD
     après badMs, et valeur refusée au re-fetch tant que la vitesse
     reste incompatible (ou distrustMs écoulé).
+11. Filtre chocs durci après test réel : ROAD desserré (dom 1.4 → 1.1,
+    maxMs 150 → 320, fenêtre 420 ms — un dos-d'âne réel dure 250-400 ms
+    et secoue aussi l'horizontal) + plafond physique PHYS.accelMax :
+    une « accélération » > 0.5 g ne peut pas venir d'un moteur → classée
+    route dégradée, jamais pénalisée. Le freinage fort reste pénalisé.
 10. Retours du test réel : TH.light 0.30 → 0.40 (la conduite souple
     était flaggée) ; RATE recalibré (cost 0.25, minKm 8 — l'escalier
     −20/évt venait du plancher 5 km × coût 0.5 sur trajets courts) ;
@@ -263,7 +268,8 @@ const TH = { light: 0.40, med: 0.45, hard: 0.62 };          // seuils d'à-coups
 const PEN = { light: 2, med: 5, hard: 9 };                   // pénalités
 const PEN_SPEED = { minor: 4, major: 10 };                   // excès <15 / >=15 km/h
 const RATE = { cost: 0.25, minKm: 8 };                       // score = 100 − cost × (pénalités/100 km) ; minKm amortit les trajets courts. Un light isolé : −2.5 à 20 km, −6 au plancher (avant : −20, escalier fixe sous 5 km)
-const ROAD = { dom: 1.4, maxMs: 150, windowMs: 260 };        // choc de route : |vert| > dom×|horiz| ET horiz élevé < maxMs → non pénalisé ; windowMs = fenêtre d'observation
+const ROAD = { dom: 1.1, maxMs: 320, windowMs: 420 };        // choc de route : |vert| > dom×|horiz| ET horiz élevé < maxMs → non pénalisé. Desserré après test réel : un dos-d'âne = 2 essieux + rebond (250-400 ms), et il secoue aussi l'horizontal
+const PHYS = { accelMax: 0.5 };                              // plafond physique : un moteur ne produit pas > 0.5 g — « accélération » au-dessus = choc de route, jamais pénalisé (le freinage d'urgence, lui, peut dépasser 1 g et reste pénalisé)
 const LIMIT_SANE = { factor: 1.8, badMs: 15000, distrustMs: 180000, clearFactor: 1.2 }; // limite absurde : vitesse soutenue > factor×limite → limite rejetée, jamais pénalisée ; réhabilitée après distrustMs ou vitesse ≤ clearFactor×limite
 const COOLDOWN = 1200;                                       // ms entre événements
 const ROT_UNSTABLE = 60, ROT_STABLE = 25;                    // °/s gyroscope (hystérésis)
@@ -655,7 +661,10 @@ function TraceCollect() {
               const lat = Math.sqrt(Math.max(pe.peakH ** 2 - lon ** 2, 0));
               type = Math.abs(lon) >= lat ? (lon < 0 ? "brake" : "accel") : "turn";
             }
-            registerEvent(pe.peakH, type);
+            // plafond physique : une « accélération » > accelMax ne peut pas venir du
+            // moteur — c'est un choc (dos-d'âne) qui a fui dans le plan horizontal
+            if (type === "accel" && pe.peakH > PHYS.accelMax) registerEvent(pe.peakH, "road", 0);
+            else registerEvent(pe.peakH, type);
           }
         }
       } else if (hMag >= TH.light && now - lastEvAt.current >= COOLDOWN) {
