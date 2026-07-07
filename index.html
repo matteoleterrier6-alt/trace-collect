@@ -43,6 +43,13 @@ Fixes vs v3 (artifact) :
     tort — jamais de pénalité dans ce cas, limite retirée du HUD
     après badMs, et valeur refusée au re-fetch tant que la vitesse
     reste incompatible (ou distrustMs écoulé).
+10. Retours du test réel : TH.light 0.30 → 0.40 (la conduite souple
+    était flaggée) ; RATE recalibré (cost 0.25, minKm 8 — l'escalier
+    −20/évt venait du plancher 5 km × coût 0.5 sur trajets courts) ;
+    calibration de l'axe avant ORIENTÉE par la vitesse GPS (avant,
+    accél/frein doux s'annulaient → sens de l'axe aléatoire → types
+    frein/accél inversés une fois sur deux) ; taux pén./100 km
+    affiché au bilan pour suivre la calibration.
  Divers : trajets < 30 s sans événement ni distance ignorés,
  durées > 1 h lisibles (fmtDur), état "chaîne inactive" affiché
  hors HTTPS.
@@ -252,10 +259,10 @@ const DRAFT_KEY = "trace:draft:v3c";
 
 // ---------- PARAMÈTRES (tout se règle ici) ----------
 const G = 9.81;
-const TH = { light: 0.30, med: 0.45, hard: 0.62 };          // seuils d'à-coups (g)
+const TH = { light: 0.40, med: 0.45, hard: 0.62 };          // seuils d'à-coups (g) — light remonté de 0.30 (flaggait la conduite normale) ; plage à tester : 0.38-0.40
 const PEN = { light: 2, med: 5, hard: 9 };                   // pénalités
 const PEN_SPEED = { minor: 4, major: 10 };                   // excès <15 / >=15 km/h
-const RATE = { cost: 0.5, minKm: 5 };                        // score = 100 − cost × (pénalités/100 km) ; minKm amortit les trajets courts
+const RATE = { cost: 0.25, minKm: 8 };                       // score = 100 − cost × (pénalités/100 km) ; minKm amortit les trajets courts. Un light isolé : −2.5 à 20 km, −6 au plancher (avant : −20, escalier fixe sous 5 km)
 const ROAD = { dom: 1.4, maxMs: 150, windowMs: 260 };        // choc de route : |vert| > dom×|horiz| ET horiz élevé < maxMs → non pénalisé ; windowMs = fenêtre d'observation
 const LIMIT_SANE = { factor: 1.8, badMs: 15000, distrustMs: 180000, clearFactor: 1.2 }; // limite absurde : vitesse soutenue > factor×limite → limite rejetée, jamais pénalisée ; réhabilitée après distrustMs ou vitesse ≤ clearFactor×limite
 const COOLDOWN = 1200;                                       // ms entre événements
@@ -318,9 +325,10 @@ async function sha256(str) {
 }
 // Scelle TOUT le trajet (événements détaillés + tracé), pas juste le nombre d'événements.
 const tripCore = (t) =>
-  JSON.stringify({ id: t.id, date: t.date, score: t.score, durationSec: t.durationSec,
+  JSON.stringify({ id: t.id, date: t.date, score: t.score, pen100: t.pen100, durationSec: t.durationSec,
     distanceKm: t.distanceKm, role: t.role, mode: t.mode, unstableSec: t.unstableSec,
     recovered: !!t.recovered, events: t.events || [], path: t.path || [] });
+    // pen100 absent des anciens trajets → clé omise par JSON.stringify → leurs hashs restent valides
 async function sealTrip(trip, prevHash) {
   trip.prevHash = prevHash || "genesis";
   trip.hash = await sha256(trip.prevHash + tripCore(trip));
@@ -373,10 +381,10 @@ const fmtDur = (s) => s >= 3600
 // qu'un trajet court. Le plancher minKm évite la division par ~0 en début de
 // trajet et amortit les trajets très courts — le score « se stabilise » avec
 // les kilomètres.
+const rate100 = (penalty, distanceKm) =>
+  (penalty / Math.max(distanceKm || 0, RATE.minKm)) * 100; // pénalités ramenées à 100 km
 function computeScore(penalty, distanceKm) {
-  const effKm = Math.max(distanceKm || 0, RATE.minKm);
-  const per100 = (penalty / effKm) * 100;
-  return Math.max(0, Math.min(100, Math.round(100 - RATE.cost * per100)));
+  return Math.max(0, Math.min(100, Math.round(100 - RATE.cost * rate100(penalty, distanceKm))));
 }
 const gradeOf = (s) =>
   s >= 90 ? { label: "Exemplaire", tone: "good" } :
@@ -396,6 +404,7 @@ function draftToTrip(d) {
   return {
     id: d.startAt, date: new Date(d.startAt).toISOString(),
     score: computeScore(d.penalty || 0, (d.dist || 0) / 1000),
+    pen100: Math.round(rate100(d.penalty || 0, (d.dist || 0) / 1000) * 10) / 10,
     durationSec: Math.round((d.savedAt - d.startAt) / 1000),
     distanceKm: Math.round((d.dist || 0) / 100) / 10,
     events: d.events || [], path: d.path || [],
@@ -457,6 +466,8 @@ function TraceCollect() {
   const limitRef = useRef(null);
   const overSince = useRef(0);
   const lastLimitFetch = useRef(0);
+  const speedTrend = useRef(0);        // +1 vitesse GPS en hausse, −1 en baisse, 0 incertain (oriente l'axe avant)
+  const lastKmhTrend = useRef(null);
   const speedEma = useRef(0);          // vitesse lissée (~7 s) pour juger la plausibilité des limites
   const implausibleSince = useRef(0);  // depuis quand la limite courante est incohérente
   const distrust = useRef(null);       // { value, until } : valeur de limite écartée, refusée au re-fetch
@@ -615,8 +626,12 @@ function TraceCollect() {
       gNow.current = { x: hx / G, y: hz / G, mag: stable.current ? hMag : 0 };
       if (!scoring() || !stable.current) { pendingEv.current = null; return; } // téléphone manipulé → rien ne compte
       const f = fwd.current;
-      if (!f.locked && hMag > FWD.min && hMag < FWD.max) {
-        f.x += hx / G; f.y += hy / G; f.z += hz / G; f.acc += hMag;
+      // Calibration ORIENTÉE par le GPS : accumulation signée par le sens de variation
+      // de la vitesse — accélérer et freiner renforcent le même axe avant au lieu de
+      // s'annuler. Avant, le sens de l'axe était aléatoire → frein/accél inversés.
+      const trend = speedTrend.current;
+      if (!f.locked && trend !== 0 && hMag > FWD.min && hMag < FWD.max) {
+        f.x += trend * hx / G; f.y += trend * hy / G; f.z += trend * hz / G; f.acc += hMag;
         if (f.acc >= FWD.need) { const n = Math.hypot(f.x, f.y, f.z) || 1; f.x /= n; f.y /= n; f.z /= n; f.locked = true; }
       }
       // Un candidat n'est pas pénalisé à chaud : on l'observe pendant windowMs
@@ -655,6 +670,12 @@ function TraceCollect() {
         const kmh = pos.coords.speed != null && pos.coords.speed >= 0 ? pos.coords.speed * 3.6 : speedRef.current;
         speedRef.current = kmh;
         speedEma.current += 0.15 * (kmh - speedEma.current); // vitesse soutenue (converge en ~7 s)
+        // sens de variation de la vitesse : oriente la calibration de l'axe avant
+        if (lastKmhTrend.current != null) {
+          const dv = kmh - lastKmhTrend.current;
+          speedTrend.current = dv > 1.5 ? 1 : dv < -1.5 ? -1 : 0;
+        }
+        lastKmhTrend.current = kmh;
         const p = { lat: pos.coords.latitude, lon: pos.coords.longitude };
         // --- détection auto (jamais pendant qu'un trajet attend son rôle) ---
         const A = autoState.current, now = Date.now();
@@ -772,6 +793,7 @@ function TraceCollect() {
     speedRef.current = 0; distRef.current = 0; lastPos.current = null;
     pathRef.current = []; limitRef.current = null; overSince.current = 0;
     speedEma.current = 0; implausibleSince.current = 0; distrust.current = null;
+    speedTrend.current = 0; lastKmhTrend.current = null;
     setEvents([]); setHint(""); setMode(which);
     setUi({ ...initUi(), cal: which === "demo" });
     setScreen("drive");
@@ -806,6 +828,7 @@ function TraceCollect() {
     const trip = {
       id: Date.now(), date: new Date().toISOString(),
       score: computeScore(penalty.current, distRef.current / 1000),
+      pen100: Math.round(rate100(penalty.current, distRef.current / 1000) * 10) / 10,
       durationSec,
       distanceKm: Math.round(distRef.current / 100) / 10,
       events: eventsRef.current,
@@ -1092,6 +1115,7 @@ function Summary({ trip, trips, onAgain, onPassport, onHome }) {
             <span className={"ds-grade big tone-" + g.tone}>{g.label}</span>
             <span className="ds-tripsub">
               {fmtDur(trip.durationSec)}{trip.distanceKm ? ` · ${trip.distanceKm} km` : ""}
+              {trip.pen100 != null ? ` · ${trip.pen100} pén./100 km` : ""}
               {trip.unstableSec ? ` · ${trip.unstableSec}s instable ignorées` : ""}
             </span>
           </div>
