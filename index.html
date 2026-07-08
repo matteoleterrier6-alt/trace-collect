@@ -43,6 +43,12 @@ Fixes vs v3 (artifact) :
     tort — jamais de pénalité dans ce cas, limite retirée du HUD
     après badMs, et valeur refusée au re-fetch tant que la vitesse
     reste incompatible (ou distrustMs écoulé).
+12. Pénalités continues (« l'intelligence ») : plus de paliers fixes,
+    la perte varie avec la gravité — penOfG(g) pour les à-coups,
+    penOfExcess(km/h) pour la vitesse, toutes deux BORNÉES. Au pire
+    cas (plancher de distance) : petit à-coup ≈ −2 pts de score,
+    geste dur ≈ −5, excès énorme ≈ −7 maximum. Sur un long trajet le
+    taux par 100 km dilue encore. L'excès affiché en +km/h au journal.
 11. Filtre chocs durci après test réel : ROAD desserré (dom 1.4 → 1.1,
     maxMs 150 → 320, fenêtre 420 ms — un dos-d'âne réel dure 250-400 ms
     et secoue aussi l'horizontal) + plafond physique PHYS.accelMax :
@@ -265,9 +271,15 @@ const DRAFT_KEY = "trace:draft:v3c";
 // ---------- PARAMÈTRES (tout se règle ici) ----------
 const G = 9.81;
 const TH = { light: 0.40, med: 0.45, hard: 0.62 };          // seuils d'à-coups (g) — light remonté de 0.30 (flaggait la conduite normale) ; plage à tester : 0.38-0.40
-const PEN = { light: 2, med: 5, hard: 9 };                   // pénalités
-const PEN_SPEED = { minor: 4, major: 10 };                   // excès <15 / >=15 km/h
-const RATE = { cost: 0.25, minKm: 8 };                       // score = 100 − cost × (pénalités/100 km) ; minKm amortit les trajets courts. Un light isolé : −2.5 à 20 km, −6 au plancher (avant : −20, escalier fixe sous 5 km)
+// Pénalités CONTINUES : la perte varie avec la gravité du geste au lieu de
+// paliers fixes. Bornées pour qu'au pire cas (plancher de distance), un
+// événement coûte : petit à-coup ≈ −2 pts de score, geste dur ≈ −5, et
+// JAMAIS plus de ~−7 (au plancher, 1 pt de pénalité = 3.125 pts de score).
+const PEN = { base: 0.5, slope: 3.0, max: 2.2 };             // à-coups : pen = base + slope×(g − TH.light), borné à max
+const PEN_SPEED = { base: 0.6, perKmh: 0.04, max: 2.2, hardAt: 1.4 }; // excès : pen = base + perKmh×(km/h au-dessus), borné ; hardAt = affichage « grave »
+const penOfG = (g) => Math.min(PEN.base + PEN.slope * Math.max(g - TH.light, 0), PEN.max);
+const penOfExcess = (over) => Math.min(PEN_SPEED.base + PEN_SPEED.perKmh * Math.max(over, 0), PEN_SPEED.max);
+const RATE = { cost: 0.25, minKm: 8 };                       // score = 100 − cost × (pénalités/100 km) ; minKm amortit les trajets courts. Un petit à-coup : ≈ −0.7 à 20 km, ≈ −2 au plancher
 const ROAD = { dom: 1.1, maxMs: 320, windowMs: 420 };        // choc de route : |vert| > dom×|horiz| ET horiz élevé < maxMs → non pénalisé. Desserré après test réel : un dos-d'âne = 2 essieux + rebond (250-400 ms), et il secoue aussi l'horizontal
 const PHYS = { accelMax: 0.5 };                              // plafond physique : un moteur ne produit pas > 0.5 g — « accélération » au-dessus = choc de route, jamais pénalisé (le freinage d'urgence, lui, peut dépasser 1 g et reste pénalisé)
 const LIMIT_SANE = { factor: 1.8, badMs: 15000, distrustMs: 180000, clearFactor: 1.2 }; // limite absurde : vitesse soutenue > factor×limite → limite rejetée, jamais pénalisée ; réhabilitée après distrustMs ou vitesse ≤ clearFactor×limite
@@ -570,13 +582,13 @@ function TraceCollect() {
     return () => clearInterval(iv);
   }, [screen]);
 
-  const registerEvent = useCallback((gDyn, type, pen) => {
+  const registerEvent = useCallback((gDyn, type, pen, extra) => {
     const now = Date.now();
     if (type !== "speed" && now - lastEvAt.current < COOLDOWN) return;
     if (type !== "speed") lastEvAt.current = now;
-    const sev = type === "speed" ? (pen >= PEN_SPEED.major ? "hard" : "med") : type === "road" ? "light" : sevOf(gDyn);
-    penalty.current += pen != null ? pen : PEN[sev];
-    const ev = { t: (now - startAt.current) / 1000, g: gDyn, sev, type: type || "jolt" };
+    const sev = type === "speed" ? (pen >= PEN_SPEED.hardAt ? "hard" : "med") : type === "road" ? "light" : sevOf(gDyn);
+    penalty.current += pen != null ? pen : penOfG(gDyn);
+    const ev = { t: (now - startAt.current) / 1000, g: gDyn, sev, type: type || "jolt", ...(extra || {}) };
     eventsRef.current = [...eventsRef.current, ev];
     setEvents((e) => [ev, ...e].slice(0, 40));
   }, []);
@@ -733,7 +745,7 @@ function TraceCollect() {
             if (kmh < lim2 * LIMIT_SANE.factor) {
               overSince.current = now + 15000; // anti-spam : 15 s avant le prochain
               const excess = kmh - lim2;
-              registerEvent(0, "speed", excess >= 15 ? PEN_SPEED.major : PEN_SPEED.minor);
+              registerEvent(0, "speed", penOfExcess(excess), { over: Math.round(excess) });
             }
           }
         } else overSince.current = 0;
@@ -771,8 +783,10 @@ function TraceCollect() {
         const types = ["brake", "brake", "accel", "turn"];
         registerEvent(g, types[Math.floor(Math.random() * types.length)]);
       }
-      if (Math.random() < 0.012)
-        registerEvent(0, "speed", Math.random() < 0.5 ? PEN_SPEED.minor : PEN_SPEED.major);
+      if (Math.random() < 0.012) {
+        const over = 6 + Math.random() * 34;
+        registerEvent(0, "speed", penOfExcess(over), { over: Math.round(over) });
+      }
       if (Math.random() < 0.02)
         registerEvent(0.3 + Math.random() * 0.4, "road", 0); // choc de route simulé, non pénalisé
       if (Math.random() < 0.01) { // instabilité simulée
@@ -1055,6 +1069,7 @@ function Drive({ ui, events, hint, onEnd, mode }) {
           <div className={"ds-logrow sev-" + e.sev} key={i}>
             <span className="ds-logsev">{TYPE_LABEL[e.type || "jolt"]}</span>
             {e.type !== "speed" && <span className="ds-logg">{e.g.toFixed(2)} g</span>}
+            {e.type === "speed" && e.over != null && <span className="ds-logg">+{e.over} km/h</span>}
             <span className="ds-logt">{fmtT(e.t)}</span>
           </div>
         ))}
