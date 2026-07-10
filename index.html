@@ -43,6 +43,18 @@ Fixes vs v3 (artifact) :
     tort — jamais de pénalité dans ce cas, limite retirée du HUD
     après badMs, et valeur refusée au re-fetch tant que la vitesse
     reste incompatible (ou distrustMs écoulé).
+13. Réorientation complète téléphone → véhicule : matrice (u, f, l)
+    avec u = gravité (vertical), f = axe avant appris UNIQUEMENT en
+    ligne droite (cap GPS stable) pendant les variations de vitesse,
+    signé par le GPS, orthogonalisé ; l = u × f (latéral). Appliquée
+    à chaque échantillon avant classification → frein/accél/virage
+    corrects quelle que soit la position du téléphone. Recalage
+    continu (FWD.adapt) + réapprentissage complet dès que le gyro
+    détecte que le téléphone a bougé. Limite honnête : en poche, le
+    téléphone bouge avec la jambe → pauses gyro fréquentes ; fiable
+    surtout posé/calé. Le cap GPS ne donne PAS l'orientation du
+    téléphone (référentiel Terre) : il sert à détecter la ligne
+    droite, où l'accélération est purement longitudinale.
 12. Pénalités continues (« l'intelligence ») : plus de paliers fixes,
     la perte varie avec la gravité — penOfG(g) pour les à-coups,
     penOfExcess(km/h) pour la vitesse, toutes deux BORNÉES. Au pire
@@ -285,8 +297,10 @@ const PHYS = { accelMax: 0.5 };                              // plafond physique
 const LIMIT_SANE = { factor: 1.8, badMs: 15000, distrustMs: 180000, clearFactor: 1.2 }; // limite absurde : vitesse soutenue > factor×limite → limite rejetée, jamais pénalisée ; réhabilitée après distrustMs ou vitesse ≤ clearFactor×limite
 const COOLDOWN = 1200;                                       // ms entre événements
 const ROT_UNSTABLE = 60, ROT_STABLE = 25;                    // °/s gyroscope (hystérésis)
+const GRAV_ALPHA = 0.004;                                    // EMA gravité (τ ≈ 4 s à 60 Hz). Plus rapide = absorbe les vraies accélérations et crée des résidus fantômes de signe inverse ; les re-positionnements du téléphone sont couverts par la remise à zéro gyro, pas par cette EMA
 const STABLE_DELAY = 1500;                                   // ms de calme avant reprise
-const FWD = { min: 0.08, max: 0.28, need: 3.0 };             // calibration axe avant
+const FWD = { min: 0.08, max: 0.28, need: 3.0,               // calibration axe avant : bande d'accels douces (g) + poids requis
+  adapt: 0.05, straightDegS: 6, minKmh: 15 };                // adapt = recalage continu de l'axe ; il ne s'apprend qu'en LIGNE DROITE (cap GPS stable à ±straightDegS °/s, au-dessus de minKmh)
 const AUTO = { startKmh: 18, startMs: 8000, stopKmh: 6, stopMs: 240000 }; // stop 4 min : feux + bouchons
 const OVERSPEED_TOL = 5;                                     // km/h de tolérance
 const OVERSPEED_SUSTAIN = 5000;                              // ms au-dessus avant événement
@@ -486,6 +500,10 @@ function TraceCollect() {
   const lastLimitFetch = useRef(0);
   const speedTrend = useRef(0);        // +1 vitesse GPS en hausse, −1 en baisse, 0 incertain (oriente l'axe avant)
   const lastKmhTrend = useRef(null);
+  const straight = useRef(false);      // cap GPS stable → ligne droite : seule fenêtre d'apprentissage de l'axe
+  const lastHdg = useRef(null);
+  const lastHdgAt = useRef(0);
+  const headingSeen = useRef(false);   // si l'appareil ne fournit jamais de cap, on n'exige pas la ligne droite
   const speedEma = useRef(0);          // vitesse lissée (~7 s) pour juger la plausibilité des limites
   const implausibleSince = useRef(0);  // depuis quand la limite courante est incohérente
   const distrust = useRef(null);       // { value, until } : valeur de limite écartée, refusée au re-fetch
@@ -620,7 +638,10 @@ function TraceCollect() {
       if (r && r.alpha != null) {
         const rot = Math.sqrt(r.alpha ** 2 + r.beta ** 2 + r.gamma ** 2);
         rotEma.current += 0.15 * (rot - rotEma.current);
-        if (stable.current && rotEma.current > ROT_UNSTABLE) { stable.current = false; stableSince.current = 0; }
+        if (stable.current && rotEma.current > ROT_UNSTABLE) {
+          stable.current = false; stableSince.current = 0;
+          fwd.current = { x: 0, y: 0, z: 0, acc: 0, locked: false }; // le téléphone a bougé → la matrice d'orientation est fausse, on la réapprend
+        }
         else if (!stable.current) {
           unstableMs.current += dt;
           if (rotEma.current < ROT_STABLE) {
@@ -634,23 +655,52 @@ function TraceCollect() {
       gotReading.current = true;
       const gv = grav.current;
       if (!gv.set) { gv.x = a.x; gv.y = a.y; gv.z = a.z; gv.set = true; }
-      else { const al = 0.02; gv.x += al * (a.x - gv.x); gv.y += al * (a.y - gv.y); gv.z += al * (a.z - gv.z); }
+      else { gv.x += GRAV_ALPHA * (a.x - gv.x); gv.y += GRAV_ALPHA * (a.y - gv.y); gv.z += GRAV_ALPHA * (a.z - gv.z); }
       const dx = a.x - gv.x, dy = a.y - gv.y, dz = a.z - gv.z;
       const gn = Math.sqrt(gv.x ** 2 + gv.y ** 2 + gv.z ** 2) || 1;
       const ux = gv.x / gn, uy = gv.y / gn, uz = gv.z / gn;
       const dot = dx * ux + dy * uy + dz * uz;
       const hx = dx - dot * ux, hy = dy - dot * uy, hz = dz - dot * uz;
       const hMag = Math.sqrt(hx ** 2 + hy ** 2 + hz ** 2) / G;
-      gNow.current = { x: hx / G, y: hz / G, mag: stable.current ? hMag : 0 };
-      if (!scoring() || !stable.current) { pendingEv.current = null; return; } // téléphone manipulé → rien ne compte
+      // --- ROTATION téléphone → véhicule, appliquée à CHAQUE échantillon ---
+      // u = axe vertical (gravité), f = axe avant (appris en ligne droite),
+      // l = u × f = axe latéral. lon = avant/arrière (+ accél, − frein),
+      // lat = gauche/droite. Valide quelle que soit la position du téléphone.
       const f = fwd.current;
-      // Calibration ORIENTÉE par le GPS : accumulation signée par le sens de variation
-      // de la vitesse — accélérer et freiner renforcent le même axe avant au lieu de
-      // s'annuler. Avant, le sens de l'axe était aléatoire → frein/accél inversés.
+      let lon = null, lat = null;
+      if (f.locked) {
+        lon = (hx * f.x + hy * f.y + hz * f.z) / G;
+        const lx = uy * f.z - uz * f.y, ly = uz * f.x - ux * f.z, lz = ux * f.y - uy * f.x;
+        lat = (hx * lx + hy * ly + hz * lz) / G;
+      }
+      gNow.current = f.locked
+        ? { x: lat, y: -lon, mag: stable.current ? hMag : 0 } // HUD en référentiel véhicule : haut = freinage
+        : { x: hx / G, y: hz / G, mag: stable.current ? hMag : 0 };
+      if (!scoring() || !stable.current) { pendingEv.current = null; return; } // téléphone manipulé → rien ne compte
+      // Apprentissage + RECALAGE CONTINU de l'axe avant : uniquement en ligne droite
+      // (cap GPS stable) pendant que la vitesse varie — accélérer et freiner, signés
+      // par le GPS, renforcent le même axe. Orthogonalisé contre la gravité.
       const trend = speedTrend.current;
-      if (!f.locked && trend !== 0 && hMag > FWD.min && hMag < FWD.max) {
-        f.x += trend * hx / G; f.y += trend * hy / G; f.z += trend * hz / G; f.acc += hMag;
-        if (f.acc >= FWD.need) { const n = Math.hypot(f.x, f.y, f.z) || 1; f.x /= n; f.y /= n; f.z /= n; f.locked = true; }
+      const straightOk = headingSeen.current ? straight.current : true; // pas de cap fourni → on ne bloque pas
+      if (trend !== 0 && straightOk && hMag > FWD.min && hMag < FWD.max) {
+        if (!f.locked) {
+          f.x += trend * hx / G; f.y += trend * hy / G; f.z += trend * hz / G; f.acc += hMag;
+          if (f.acc >= FWD.need) {
+            const dU = f.x * ux + f.y * uy + f.z * uz;
+            f.x -= dU * ux; f.y -= dU * uy; f.z -= dU * uz;
+            const n = Math.hypot(f.x, f.y, f.z) || 1; f.x /= n; f.y /= n; f.z /= n;
+            f.locked = true;
+          }
+        } else {
+          // le téléphone peut glisser lentement : l'axe suit (EMA), re-orthogonalisé
+          const n0 = Math.sqrt(hx ** 2 + hy ** 2 + hz ** 2) || 1;
+          f.x += FWD.adapt * (trend * hx / n0 - f.x);
+          f.y += FWD.adapt * (trend * hy / n0 - f.y);
+          f.z += FWD.adapt * (trend * hz / n0 - f.z);
+          const dU = f.x * ux + f.y * uy + f.z * uz;
+          f.x -= dU * ux; f.y -= dU * uy; f.z -= dU * uz;
+          const n = Math.hypot(f.x, f.y, f.z) || 1; f.x /= n; f.y /= n; f.z /= n;
+        }
       }
       // Un candidat n'est pas pénalisé à chaud : on l'observe pendant windowMs
       // pour distinguer un choc de route (pic vertical dominant, très bref) d'une
@@ -658,7 +708,7 @@ function TraceCollect() {
       const vMag = Math.abs(dot) / G; // composante le long de la gravité
       const pe = pendingEv.current;
       if (pe) {
-        if (hMag > pe.peakH) { pe.peakH = hMag; pe.hx = hx; pe.hy = hy; pe.hz = hz; }
+        if (hMag > pe.peakH) { pe.peakH = hMag; pe.lon = lon; pe.lat = lat; } // composantes véhicule au pic
         if (vMag > pe.peakV) pe.peakV = vMag;
         if (hMag >= TH.light) pe.lastAbove = now;
         if (now - pe.t0 >= ROAD.windowMs) {
@@ -668,11 +718,8 @@ function TraceCollect() {
             registerEvent(pe.peakH, "road", 0); // choc de route : loggé, zéro pénalité
           } else {
             let type = "jolt";
-            if (f.locked) {
-              const lon = (pe.hx / G) * f.x + (pe.hy / G) * f.y + (pe.hz / G) * f.z;
-              const lat = Math.sqrt(Math.max(pe.peakH ** 2 - lon ** 2, 0));
-              type = Math.abs(lon) >= lat ? (lon < 0 ? "brake" : "accel") : "turn";
-            }
+            if (pe.lon != null)
+              type = Math.abs(pe.lon) >= Math.abs(pe.lat) ? (pe.lon < 0 ? "brake" : "accel") : "turn";
             // plafond physique : une « accélération » > accelMax ne peut pas venir du
             // moteur — c'est un choc (dos-d'âne) qui a fui dans le plan horizontal
             if (type === "accel" && pe.peakH > PHYS.accelMax) registerEvent(pe.peakH, "road", 0);
@@ -680,7 +727,7 @@ function TraceCollect() {
           }
         }
       } else if (hMag >= TH.light && now - lastEvAt.current >= COOLDOWN) {
-        pendingEv.current = { t0: now, peakH: hMag, peakV: vMag, hx, hy, hz, lastAbove: now };
+        pendingEv.current = { t0: now, peakH: hMag, peakV: vMag, lon, lat, lastAbove: now };
       }
     };
     window.addEventListener("devicemotion", onMotion);
@@ -697,6 +744,20 @@ function TraceCollect() {
           speedTrend.current = dv > 1.5 ? 1 : dv < -1.5 ? -1 : 0;
         }
         lastKmhTrend.current = kmh;
+        // cap GPS : détecte la LIGNE DROITE — la seule phase où l'accélération
+        // horizontale est purement longitudinale, donc où l'axe avant s'apprend
+        const hdg = pos.coords.heading;
+        if (hdg != null && !isNaN(hdg) && kmh >= FWD.minKmh) {
+          headingSeen.current = true;
+          if (lastHdg.current != null) {
+            let dh = Math.abs(hdg - lastHdg.current); if (dh > 180) dh = 360 - dh;
+            const dtH = Math.max((Date.now() - lastHdgAt.current) / 1000, 0.2);
+            straight.current = dh / dtH <= FWD.straightDegS;
+          }
+          lastHdg.current = hdg; lastHdgAt.current = Date.now();
+        } else {
+          straight.current = false; lastHdg.current = null;
+        }
         const p = { lat: pos.coords.latitude, lon: pos.coords.longitude };
         // --- détection auto (jamais pendant qu'un trajet attend son rôle) ---
         const A = autoState.current, now = Date.now();
@@ -817,6 +878,7 @@ function TraceCollect() {
     pathRef.current = []; limitRef.current = null; overSince.current = 0;
     speedEma.current = 0; implausibleSince.current = 0; distrust.current = null;
     speedTrend.current = 0; lastKmhTrend.current = null;
+    straight.current = false; lastHdg.current = null; lastHdgAt.current = 0; headingSeen.current = false;
     setEvents([]); setHint(""); setMode(which);
     setUi({ ...initUi(), cal: which === "demo" });
     setScreen("drive");
