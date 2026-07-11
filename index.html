@@ -43,6 +43,14 @@ Fixes vs v3 (artifact) :
     tort — jamais de pénalité dans ce cas, limite retirée du HUD
     après badMs, et valeur refusée au re-fetch tant que la vitesse
     reste incompatible (ou distrustMs écoulé).
+14. Règle absolue « on ne pénalise QUE le contrôlable » — trois
+    filtres appliqués dans l'ordre avant classification : F1 choc
+    vertical (> 90 % de la force totale, mesuré le long de la
+    gravité) → ignoré peu importe la force ; F2 vibration (EMA
+    500 ms de l'horizontal < 0.12 g) → bruit, rien ne compte ;
+    F3 durée (burst horizontal < 150 ms au-dessus de 0.12 g) →
+    accidentel, ignoré. Seul un geste horizontal soutenu ≥ 150 ms
+    dépassant 0.40 g est classé et pénalisé (max ~7 pts).
 13. Réorientation complète téléphone → véhicule : matrice (u, f, l)
     avec u = gravité (vertical), f = axe avant appris UNIQUEMENT en
     ligne droite (cap GPS stable) pendant les variations de vitesse,
@@ -292,7 +300,11 @@ const PEN_SPEED = { base: 0.6, perKmh: 0.04, max: 2.2, hardAt: 1.4 }; // excès 
 const penOfG = (g) => Math.min(PEN.base + PEN.slope * Math.max(g - TH.light, 0), PEN.max);
 const penOfExcess = (over) => Math.min(PEN_SPEED.base + PEN_SPEED.perKmh * Math.max(over, 0), PEN_SPEED.max);
 const RATE = { cost: 0.25, minKm: 8 };                       // score = 100 − cost × (pénalités/100 km) ; minKm amortit les trajets courts. Un petit à-coup : ≈ −0.7 à 20 km, ≈ −2 au plancher
-const ROAD = { dom: 1.1, maxMs: 320, windowMs: 420 };        // choc de route : |vert| > dom×|horiz| ET horiz élevé < maxMs → non pénalisé. Desserré après test réel : un dos-d'âne = 2 essieux + rebond (250-400 ms), et il secoue aussi l'horizontal
+const ROAD = { dom: 1.1, maxMs: 320, windowMs: 420 };        // complément géométrique : pic vertical dominant ET bref → route. windowMs = fenêtre d'observation des candidats
+// ---- FILTRES « on ne pénalise QUE le contrôlable » (appliqués dans cet ordre) ----
+const F1_VERT = { ratio: 0.90 };                             // Filtre 1 : |vertical| > 90 % de la force totale → choc de route, ignoré PEU IMPORTE sa force
+const F2_NOISE = { emaMs: 500, floor: 0.12 };                // Filtre 2 : EMA 500 ms de l'horizontal < 0.12 g → vibration normale, rien ne compte
+const F3_MIN_MS = 150;                                       // Filtre 3 : burst horizontal < 150 ms = accidentel (ignoré) ; ≥ 150 ms = geste intentionnel
 const PHYS = { accelMax: 0.5 };                              // plafond physique : un moteur ne produit pas > 0.5 g — « accélération » au-dessus = choc de route, jamais pénalisé (le freinage d'urgence, lui, peut dépasser 1 g et reste pénalisé)
 const LIMIT_SANE = { factor: 1.8, badMs: 15000, distrustMs: 180000, clearFactor: 1.2 }; // limite absurde : vitesse soutenue > factor×limite → limite rejetée, jamais pénalisée ; réhabilitée après distrustMs ou vitesse ≤ clearFactor×limite
 const COOLDOWN = 1200;                                       // ms entre événements
@@ -483,6 +495,9 @@ function TraceCollect() {
   const eventsRef = useRef([]);
   const lastEvAt = useRef(0);
   const pendingEv = useRef(null); // candidat en observation (fenêtre choc de route)
+  const hEma = useRef(0);         // Filtre 2 : horizontal lissé sur 500 ms
+  const floorSince = useRef(0);   // Filtre 3 : début du burst au-dessus du plancher 0.12 g
+  const floorLastAbove = useRef(0);
   const grav = useRef({ x: 0, y: 0, z: 0, set: false });
   const fwd = useRef({ x: 0, y: 0, z: 0, acc: 0, locked: false });
   const gNow = useRef({ x: 0, y: 0, mag: 0 });
@@ -705,17 +720,33 @@ function TraceCollect() {
       // Un candidat n'est pas pénalisé à chaud : on l'observe pendant windowMs
       // pour distinguer un choc de route (pic vertical dominant, très bref) d'une
       // vraie manœuvre (horizontal soutenu). Seul l'horizontal est pénalisé.
-      const vMag = Math.abs(dot) / G; // composante le long de la gravité
+      const vMag = Math.abs(dot) / G; // composante le long de la gravité (vertical véhicule)
+      // Filtre 2 : horizontal lissé (bruit de vibration) — EMA ~500 ms
+      hEma.current += Math.min(dt / F2_NOISE.emaMs, 1) * (hMag - hEma.current);
+      // Filtre 3 : bornes du burst au-dessus du plancher 0.12 g
+      if (hMag >= F2_NOISE.floor) {
+        if (!floorSince.current) floorSince.current = now;
+        floorLastAbove.current = now;
+      } else floorSince.current = 0;
       const pe = pendingEv.current;
       if (pe) {
         if (hMag > pe.peakH) { pe.peakH = hMag; pe.lon = lon; pe.lat = lat; } // composantes véhicule au pic
         if (vMag > pe.peakV) pe.peakV = vMag;
+        if (hEma.current > pe.hEmaMax) pe.hEmaMax = hEma.current;
         if (hMag >= TH.light) pe.lastAbove = now;
         if (now - pe.t0 >= ROAD.windowMs) {
           pendingEv.current = null;
-          const elevatedMs = pe.lastAbove - pe.t0;
-          if (pe.peakV > ROAD.dom * pe.peakH && elevatedMs <= ROAD.maxMs) {
-            registerEvent(pe.peakH, "road", 0); // choc de route : loggé, zéro pénalité
+          const durMs = Math.max(floorLastAbove.current, pe.lastAbove) - pe.burstStart; // durée au-dessus du plancher
+          const total = Math.sqrt(pe.peakV ** 2 + pe.peakH ** 2) || 1;
+          // ---- « on ne pénalise QUE le contrôlable » : trois filtres, dans l'ordre ----
+          if (pe.peakV / total > F1_VERT.ratio) {
+            registerEvent(pe.peakH, "road", 0);       // F1 : choc vertical > 90 % → ignoré peu importe la force
+          } else if (pe.peakV > ROAD.dom * pe.peakH && (pe.lastAbove - pe.t0) <= ROAD.maxMs) {
+            registerEvent(pe.peakH, "road", 0);       // complément géométrique : vertical dominant ET bref
+          } else if (pe.hEmaMax < F2_NOISE.floor) {
+            /* F2 : jamais > 0.12 g en horizontal soutenu → vibration, ni log ni pénalité */
+          } else if (durMs < F3_MIN_MS) {
+            registerEvent(pe.peakH, "road", 0);       // F3 : burst < 150 ms = accidentel → ignoré
           } else {
             let type = "jolt";
             if (pe.lon != null)
@@ -723,11 +754,12 @@ function TraceCollect() {
             // plafond physique : une « accélération » > accelMax ne peut pas venir du
             // moteur — c'est un choc (dos-d'âne) qui a fui dans le plan horizontal
             if (type === "accel" && pe.peakH > PHYS.accelMax) registerEvent(pe.peakH, "road", 0);
-            else registerEvent(pe.peakH, type);
+            else registerEvent(pe.peakH, type);       // geste intentionnel → classé et pénalisé
           }
         }
       } else if (hMag >= TH.light && now - lastEvAt.current >= COOLDOWN) {
-        pendingEv.current = { t0: now, peakH: hMag, peakV: vMag, lon, lat, lastAbove: now };
+        pendingEv.current = { t0: now, peakH: hMag, peakV: vMag, lon, lat, lastAbove: now,
+          burstStart: floorSince.current || now, hEmaMax: hEma.current };
       }
     };
     window.addEventListener("devicemotion", onMotion);
@@ -870,6 +902,7 @@ function TraceCollect() {
     autoStartedRef.current = !!auto;
     startAt.current = Date.now();
     penalty.current = 0; eventsRef.current = []; lastEvAt.current = 0; pendingEv.current = null;
+    hEma.current = 0; floorSince.current = 0; floorLastAbove.current = 0;
     grav.current = { x: 0, y: 0, z: 0, set: false };
     fwd.current = { x: 0, y: 0, z: 0, acc: 0, locked: false };
     gNow.current = { x: 0, y: 0, mag: 0 };
