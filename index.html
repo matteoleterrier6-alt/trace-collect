@@ -43,6 +43,14 @@ Fixes vs v3 (artifact) :
     tort — jamais de pénalité dans ce cas, limite retirée du HUD
     après badMs, et valeur refusée au re-fetch tant que la vitesse
     reste incompatible (ou distrustMs écoulé).
+15. Validation cinématique : un geste a une conséquence GPS. Après
+    classification, l'événement attend VALID.windowMs (1.5 s) puis
+    est confronté au GPS : freinage → vitesse −3 km/h, accélération
+    → +3 km/h, virage → cap ±10°. Conséquence absente = choc
+    involontaire : zéro pénalité, aucune ligne au journal — mais
+    gardé dans les données du trajet (export JSON, flag inv) pour
+    la calibration. Le journal live n'affiche QUE les gestes
+    pénalisés (rouge/orange) et les excès de vitesse.
 14. Règle absolue « on ne pénalise QUE le contrôlable » — trois
     filtres appliqués dans l'ordre avant classification : F1 choc
     vertical (> 90 % de la force totale, mesuré le long de la
@@ -204,7 +212,7 @@ html,body{margin:0;padding:0;background:#0A0F14;}
 .ds-log{flex:1;overflow-y:auto;padding:12px 18px 0;display:flex;flex-direction:column;gap:7px;}
 .ds-logempty{color:var(--muted);font-size:13px;text-align:center;padding-top:12px;font-family:'JetBrains Mono',monospace;}
 .ds-logrow{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:10px;background:var(--surface);border-left:3px solid var(--muted);animation:dsin .25s ease both;}
-.ds-logrow.sev-light{border-left-color:var(--muted);}
+.ds-logrow.sev-light{border-left-color:var(--warn);} /* tout ce qui s'affiche est pénalisé → orange/rouge */
 .ds-logrow.sev-med{border-left-color:var(--warn);}
 .ds-logrow.sev-hard{border-left-color:var(--bad);}
 @keyframes dsin{from{opacity:0;transform:translateX(-6px);}to{opacity:1;transform:none;}}
@@ -305,6 +313,8 @@ const ROAD = { dom: 1.1, maxMs: 320, windowMs: 420 };        // complément géo
 const F1_VERT = { ratio: 0.90 };                             // Filtre 1 : |vertical| > 90 % de la force totale → choc de route, ignoré PEU IMPORTE sa force
 const F2_NOISE = { emaMs: 500, floor: 0.12 };                // Filtre 2 : EMA 500 ms de l'horizontal < 0.12 g → vibration normale, rien ne compte
 const F3_MIN_MS = 150;                                       // Filtre 3 : burst horizontal < 150 ms = accidentel (ignoré) ; ≥ 150 ms = geste intentionnel
+// ---- VALIDATION CINÉMATIQUE : un geste a une conséquence GPS observable ----
+const VALID = { dKmh: 3, dDeg: 10, windowMs: 1500 };         // freinage → vitesse −3 km/h en 1.5 s ; accélération → +3 km/h ; virage → cap ±10°. Sans conséquence : choc involontaire, zéro pénalité, invisible au journal (gardé dans l'export)
 const PHYS = { accelMax: 0.5 };                              // plafond physique : un moteur ne produit pas > 0.5 g — « accélération » au-dessus = choc de route, jamais pénalisé (le freinage d'urgence, lui, peut dépasser 1 g et reste pénalisé)
 const LIMIT_SANE = { factor: 1.8, badMs: 15000, distrustMs: 180000, clearFactor: 1.2 }; // limite absurde : vitesse soutenue > factor×limite → limite rejetée, jamais pénalisée ; réhabilitée après distrustMs ou vitesse ≤ clearFactor×limite
 const COOLDOWN = 1200;                                       // ms entre événements
@@ -495,6 +505,8 @@ function TraceCollect() {
   const eventsRef = useRef([]);
   const lastEvAt = useRef(0);
   const pendingEv = useRef(null); // candidat en observation (fenêtre choc de route)
+  const validQueue = useRef([]);  // gestes en attente de validation cinématique (1.5 s)
+  const hdgNow = useRef(null);    // dernier cap GPS brut, pour la validation des virages
   const hEma = useRef(0);         // Filtre 2 : horizontal lissé sur 500 ms
   const floorSince = useRef(0);   // Filtre 3 : début du burst au-dessus du plancher 0.12 g
   const floorLastAbove = useRef(0);
@@ -605,7 +617,7 @@ function TraceCollect() {
         gx: gNow.current.x, gy: gNow.current.y, gMag: gNow.current.mag,
         speed: speedRef.current,
         elapsed: (Date.now() - startAt.current) / 1000,
-        count: eventsRef.current.length,
+        count: eventsRef.current.filter((e) => !e.inv && e.type !== "road").length, // seuls les gestes pénalisés comptent
         cal: fwd.current.locked,
         stable: stable.current,
         unstableSec: Math.round(unstableMs.current / 1000),
@@ -615,16 +627,21 @@ function TraceCollect() {
     return () => clearInterval(iv);
   }, [screen]);
 
+  // pousse un événement : pénalité + données du trajet ; visible au journal
+  // seulement si non silencieux (les chocs involontaires restent dans l'export)
+  const pushEvent = useCallback((type, g, pen, extra, silent, atMs) => {
+    const sev = type === "speed" ? (pen >= PEN_SPEED.hardAt ? "hard" : "med") : pen === 0 ? "light" : sevOf(g);
+    penalty.current += pen;
+    const ev = { t: ((atMs || Date.now()) - startAt.current) / 1000, g, sev, type: type || "jolt", ...(extra || {}) };
+    eventsRef.current = [...eventsRef.current, ev];
+    if (!silent) setEvents((e) => [ev, ...e].slice(0, 40));
+  }, []);
   const registerEvent = useCallback((gDyn, type, pen, extra) => {
     const now = Date.now();
     if (type !== "speed" && now - lastEvAt.current < COOLDOWN) return;
     if (type !== "speed") lastEvAt.current = now;
-    const sev = type === "speed" ? (pen >= PEN_SPEED.hardAt ? "hard" : "med") : type === "road" ? "light" : sevOf(gDyn);
-    penalty.current += pen != null ? pen : penOfG(gDyn);
-    const ev = { t: (now - startAt.current) / 1000, g: gDyn, sev, type: type || "jolt", ...(extra || {}) };
-    eventsRef.current = [...eventsRef.current, ev];
-    setEvents((e) => [ev, ...e].slice(0, 40));
-  }, []);
+    pushEvent(type, gDyn, pen != null ? pen : penOfG(gDyn), extra, type === "road", now); // route : silencieux
+  }, [pushEvent]);
 
   const detachSensors = useCallback(() => {
     try { cleanupRef.current(); } catch (e) {}
@@ -754,7 +771,13 @@ function TraceCollect() {
             // plafond physique : une « accélération » > accelMax ne peut pas venir du
             // moteur — c'est un choc (dos-d'âne) qui a fui dans le plan horizontal
             if (type === "accel" && pe.peakH > PHYS.accelMax) registerEvent(pe.peakH, "road", 0);
-            else registerEvent(pe.peakH, type);       // geste intentionnel → classé et pénalisé
+            else {
+              // VALIDATION CINÉMATIQUE : le geste n'est pénalisé que si sa conséquence
+              // GPS existe — vérifiée VALID.windowMs plus tard, au prochain fix
+              lastEvAt.current = now;
+              validQueue.current.push({ at: now, type, g: pe.peakH,
+                kmh0: speedRef.current, hdg0: hdgNow.current });
+            }
           }
         }
       } else if (hMag >= TH.light && now - lastEvAt.current >= COOLDOWN) {
@@ -779,6 +802,7 @@ function TraceCollect() {
         // cap GPS : détecte la LIGNE DROITE — la seule phase où l'accélération
         // horizontale est purement longitudinale, donc où l'axe avant s'apprend
         const hdg = pos.coords.heading;
+        if (hdg != null && !isNaN(hdg)) hdgNow.current = hdg;
         if (hdg != null && !isNaN(hdg) && kmh >= FWD.minKmh) {
           headingSeen.current = true;
           if (lastHdg.current != null) {
@@ -803,6 +827,25 @@ function TraceCollect() {
           else A.underSince = 0;
         }
         if (!running.current) { lastPos.current = p; return; }
+        // --- validation cinématique des gestes en attente ---
+        if (validQueue.current.length) {
+          const keep = [];
+          for (const q of validQueue.current) {
+            if (now - q.at < VALID.windowMs) { keep.push(q); continue; }
+            const dv = kmh - q.kmh0;
+            let dh = 0;
+            if (q.hdg0 != null && hdgNow.current != null) {
+              dh = Math.abs(hdgNow.current - q.hdg0); if (dh > 180) dh = 360 - dh;
+            }
+            const ok = q.type === "brake" ? dv <= -VALID.dKmh
+              : q.type === "accel" ? dv >= VALID.dKmh
+              : q.type === "turn" ? dh >= VALID.dDeg
+              : (Math.abs(dv) >= VALID.dKmh || dh >= VALID.dDeg); // à-coup non classé : une conséquence quelconque
+            if (ok) pushEvent(q.type, q.g, penOfG(q.g), null, false, q.at);      // vrai geste → pénalisé, visible
+            else pushEvent(q.type, q.g, 0, { inv: 1 }, true, q.at);              // choc involontaire → silencieux, zéro pénalité
+          }
+          validQueue.current = keep;
+        }
         if (lastPos.current) { const d = haversine(lastPos.current, p); if (d > 2 && d < 500) distRef.current += d; }
         lastPos.current = p;
         pathRef.current.push({ lat: p.lat, lon: p.lon, t: (now - startAt.current) / 1000 });
@@ -903,6 +946,7 @@ function TraceCollect() {
     startAt.current = Date.now();
     penalty.current = 0; eventsRef.current = []; lastEvAt.current = 0; pendingEv.current = null;
     hEma.current = 0; floorSince.current = 0; floorLastAbove.current = 0;
+    validQueue.current = []; hdgNow.current = null;
     grav.current = { x: 0, y: 0, z: 0, set: false };
     fwd.current = { x: 0, y: 0, z: 0, acc: 0, locked: false };
     gNow.current = { x: 0, y: 0, mag: 0 };
@@ -1213,9 +1257,10 @@ function RoleAsk({ trip, onPick, onDiscard }) {
 // ---------------- SUMMARY ----------------
 function Summary({ trip, trips, onAgain, onPassport, onHome }) {
   const g = gradeOf(trip.score);
+  const realEv = (trip.events || []).filter((e) => !e.inv && e.type !== "road"); // gestes pénalisés uniquement
   const c = { brake: 0, accel: 0, turn: 0, jolt: 0, speed: 0, road: 0 };
-  (trip.events || []).forEach((e) => c[e.type || "jolt"]++);
-  const lines = trip.role === "passenger" ? [] : coachLines(trip.events || []);
+  realEv.forEach((e) => c[e.type || "jolt"]++);
+  const lines = trip.role === "passenger" ? [] : coachLines(realEv);
   const driver = trips.filter((t) => t.role !== "passenger");
   return (
     <div className="ds-summary">
@@ -1273,7 +1318,7 @@ function RouteTrace({ trip }) {
   const sx = (lo) => pad + ((lo - minLo) / Math.max(maxLo - minLo, 1e-6)) * (W - pad * 2);
   const sy = (la) => H - pad - ((la - minLa) / Math.max(maxLa - minLa, 1e-6)) * (H - pad * 2);
   const d = pts.map((p, i) => `${i ? "L" : "M"}${sx(p[1]).toFixed(1)},${sy(p[0]).toFixed(1)}`).join(" ");
-  const evPts = (trip.events || []).map((e) => {
+  const evPts = (trip.events || []).filter((e) => !e.inv && e.type !== "road").map((e) => {
     let best = pts[0], bd = Infinity;
     for (const p of pts) { const dd = Math.abs(p[2] - e.t); if (dd < bd) { bd = dd; best = p; } }
     return { x: sx(best[1]), y: sy(best[0]), sev: e.sev, type: e.type };
@@ -1302,10 +1347,10 @@ function Passport({ trips, chainOk, onHome, onExport }) {
   const totalSec = real.reduce((s, t) => s + t.durationSec, 0);
   const totalKm = Math.round(real.reduce((s, t) => s + (t.distanceKm || 0), 0) * 10) / 10;
   const allEv = real.flatMap((t) => t.events || []);
+  const penEv = allEv.filter((e) => e.type !== "road" && !e.inv); // ni chocs de route ni chocs invalidés
   const c = { brake: 0, accel: 0, turn: 0, jolt: 0, speed: 0, road: 0 };
-  allEv.forEach((e) => c[e.type || "jolt"]++);
+  penEv.forEach((e) => c[e.type || "jolt"]++);
   const hours = Math.max(totalSec / 3600, 1 / 60);
-  const penEv = allEv.filter((e) => e.type !== "road"); // les chocs de route ne comptent pas dans le taux
   const evPerH = Math.round((penEv.length / hours) * 10) / 10;
   const last5 = real.slice(0, 5), prev5 = real.slice(5, 10);
   const trend = last5.length && prev5.length
