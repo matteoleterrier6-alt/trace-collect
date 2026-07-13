@@ -43,6 +43,11 @@ Fixes vs v3 (artifact) :
     tort — jamais de pénalité dans ce cas, limite retirée du HUD
     après badMs, et valeur refusée au re-fetch tant que la vitesse
     reste incompatible (ou distrustMs écoulé).
+16. Calibration finale sur données réelles (export d'un trajet) :
+    conduite fluide ≤ 0.47 g, gestes volontairement brusques
+    0.76-0.95 g, trou net entre les deux → TH = 0.55/0.65/0.75.
+    Pente de pénalité 3 → 7 (cap ~−7 atteint dès 0.80 g) ;
+    PHYS.accelMax 0.5 → 0.75 (doit rester au-dessus de TH.light).
 15. Validation cinématique : un geste a une conséquence GPS. Après
     classification, l'événement attend VALID.windowMs (1.5 s) puis
     est confronté au GPS : freinage → vitesse −3 km/h, accélération
@@ -298,12 +303,13 @@ const DRAFT_KEY = "trace:draft:v3c";
 
 // ---------- PARAMÈTRES (tout se règle ici) ----------
 const G = 9.81;
-const TH = { light: 0.40, med: 0.45, hard: 0.62 };          // seuils d'à-coups (g) — light remonté de 0.30 (flaggait la conduite normale) ; plage à tester : 0.38-0.40
+const TH = { light: 0.55, med: 0.65, hard: 0.75 };          // seuils d'à-coups (g) — calés sur les données réelles : conduite fluide ≤ 0.47, gestes volontairement brusques ≥ 0.76, trou net entre 0.48 et 0.76. En-dessous de light : aucun événement, même si la validation cinématique passerait
 // Pénalités CONTINUES : la perte varie avec la gravité du geste au lieu de
 // paliers fixes. Bornées pour qu'au pire cas (plancher de distance), un
-// événement coûte : petit à-coup ≈ −2 pts de score, geste dur ≈ −5, et
-// JAMAIS plus de ~−7 (au plancher, 1 pt de pénalité = 3.125 pts de score).
-const PEN = { base: 0.5, slope: 3.0, max: 2.2 };             // à-coups : pen = base + slope×(g − TH.light), borné à max
+// événement coûte : léger (~0.56 g) ≈ −2 pts de score, 0.60 g ≈ −2.7, et
+// JAMAIS plus de ~−7 — le cap est atteint dès 0.80 g (au plancher,
+// 1 pt de pénalité = 3.125 pts de score).
+const PEN = { base: 0.5, slope: 7.0, max: 2.2 };             // à-coups : pen = base + slope×(g − TH.light), borné à max (cap atteint à ~0.79 g)
 const PEN_SPEED = { base: 0.6, perKmh: 0.04, max: 2.2, hardAt: 1.4 }; // excès : pen = base + perKmh×(km/h au-dessus), borné ; hardAt = affichage « grave »
 const penOfG = (g) => Math.min(PEN.base + PEN.slope * Math.max(g - TH.light, 0), PEN.max);
 const penOfExcess = (over) => Math.min(PEN_SPEED.base + PEN_SPEED.perKmh * Math.max(over, 0), PEN_SPEED.max);
@@ -315,7 +321,7 @@ const F2_NOISE = { emaMs: 500, floor: 0.12 };                // Filtre 2 : EMA 5
 const F3_MIN_MS = 150;                                       // Filtre 3 : burst horizontal < 150 ms = accidentel (ignoré) ; ≥ 150 ms = geste intentionnel
 // ---- VALIDATION CINÉMATIQUE : un geste a une conséquence GPS observable ----
 const VALID = { dKmh: 3, dDeg: 10, windowMs: 1500 };         // freinage → vitesse −3 km/h en 1.5 s ; accélération → +3 km/h ; virage → cap ±10°. Sans conséquence : choc involontaire, zéro pénalité, invisible au journal (gardé dans l'export)
-const PHYS = { accelMax: 0.5 };                              // plafond physique : un moteur ne produit pas > 0.5 g — « accélération » au-dessus = choc de route, jamais pénalisé (le freinage d'urgence, lui, peut dépasser 1 g et reste pénalisé)
+const PHYS = { accelMax: 0.75 };                             // plafond physique : un moteur ne produit pas > 0.75 g — « accélération » au-dessus = choc de route, jamais pénalisé (le freinage d'urgence, lui, peut dépasser 1 g et reste pénalisé). Doit rester > TH.light, sinon plus aucune accélération pénalisable
 const LIMIT_SANE = { factor: 1.8, badMs: 15000, distrustMs: 180000, clearFactor: 1.2 }; // limite absurde : vitesse soutenue > factor×limite → limite rejetée, jamais pénalisée ; réhabilitée après distrustMs ou vitesse ≤ clearFactor×limite
 const COOLDOWN = 1200;                                       // ms entre événements
 const ROT_UNSTABLE = 60, ROT_STABLE = 25;                    // °/s gyroscope (hystérésis)
