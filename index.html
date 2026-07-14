@@ -43,6 +43,15 @@ Fixes vs v3 (artifact) :
     tort — jamais de pénalité dans ce cas, limite retirée du HUD
     après badMs, et valeur refusée au re-fetch tant que la vitesse
     reste incompatible (ou distrustMs écoulé).
+17. Retours du trajet réel 30 min : (a) un freinage validé qui mène
+    à l'arrêt (vitesse ≤ STOP.kmh, contrôlée STOP.checkMs après) est
+    JUSTIFIÉ — zéro pénalité, log arrière-plan « brake_stop » ; seul
+    un freinage brusque où la voiture repart est pénalisé. (b) Les
+    événements « jolt » venaient de la remise à zéro de l'axe sur
+    instabilité gyro : l'axe n'est plus jeté que si l'épisode dure
+    ≥ ROT_RESET_MS (vraie manipulation) — un choc bref ne réoriente
+    pas le téléphone. (c) Sévérité vitesse documentée : TH_SPEED,
+    « hard » à partir de +20 km/h (aligné paliers légaux FR).
 16. Calibration finale sur données réelles (export d'un trajet) :
     conduite fluide ≤ 0.47 g, gestes volontairement brusques
     0.76-0.95 g, trou net entre les deux → TH = 0.55/0.65/0.75.
@@ -310,7 +319,10 @@ const TH = { light: 0.55, med: 0.65, hard: 0.75 };          // seuils d'à-coups
 // JAMAIS plus de ~−7 — le cap est atteint dès 0.80 g (au plancher,
 // 1 pt de pénalité = 3.125 pts de score).
 const PEN = { base: 0.5, slope: 7.0, max: 2.2 };             // à-coups : pen = base + slope×(g − TH.light), borné à max (cap atteint à ~0.79 g)
-const PEN_SPEED = { base: 0.6, perKmh: 0.04, max: 2.2, hardAt: 1.4 }; // excès : pen = base + perKmh×(km/h au-dessus), borné ; hardAt = affichage « grave »
+const PEN_SPEED = { base: 0.6, perKmh: 0.04, max: 2.2 };     // excès : pen = base + perKmh×(km/h au-dessus), borné (cap atteint à +40 km/h)
+const TH_SPEED = { hard: 20 };                               // sévérité des excès, en km/h AU-DESSUS de la limite : < 20 = « med », ≥ 20 = « hard » — aligné sur les paliers légaux FR (documenté comme TH pour les forces g)
+const STOP = { kmh: 5, checkMs: 2500 };                      // freinage menant à l'arrêt (vitesse ≤ kmh, contrôlée checkMs après l'événement) = action justifiée : zéro pénalité, log arrière-plan « brake_stop »
+const ROT_RESET_MS = 2000;                                   // l'axe avant n'est réappris que si l'instabilité gyro dure ≥ 2 s (vraie manipulation) ; un choc bref fait tourner le gyro mais ne réoriente pas le téléphone
 const penOfG = (g) => Math.min(PEN.base + PEN.slope * Math.max(g - TH.light, 0), PEN.max);
 const penOfExcess = (over) => Math.min(PEN_SPEED.base + PEN_SPEED.perKmh * Math.max(over, 0), PEN_SPEED.max);
 const RATE = { cost: 0.25, minKm: 8 };                       // score = 100 − cost × (pénalités/100 km) ; minKm amortit les trajets courts. Un petit à-coup : ≈ −0.7 à 20 km, ≈ −2 au plancher
@@ -451,7 +463,9 @@ const gradeOf = (s) =>
   s >= 75 ? { label: "Solide", tone: "good" } :
   s >= 60 ? { label: "Perfectible", tone: "warn" } :
   s >= 40 ? { label: "Brusque", tone: "bad" } : { label: "À risque", tone: "bad" };
-const TYPE_LABEL = { brake: "freinage", accel: "accélération", turn: "virage", jolt: "à-coup", speed: "excès vitesse", road: "route dégradée" };
+const TYPE_LABEL = { brake: "freinage", accel: "accélération", turn: "virage", jolt: "à-coup", speed: "excès vitesse", road: "route dégradée", brake_stop: "freinage → arrêt" };
+// seuls ces événements comptent (score, compteurs, tracé) — le reste est du log d'arrière-plan
+const countsForScore = (e) => !e.inv && e.type !== "road" && e.type !== "brake_stop";
 function haversine(a, b) {
   const R = 6371000, r = Math.PI / 180;
   const dLat = (b.lat - a.lat) * r, dLon = (b.lon - a.lon) * r;
@@ -520,6 +534,7 @@ function TraceCollect() {
   const fwd = useRef({ x: 0, y: 0, z: 0, acc: 0, locked: false });
   const gNow = useRef({ x: 0, y: 0, mag: 0 });
   const rotEma = useRef(0);
+  const unstableStartAt = useRef(0); // début de l'épisode d'instabilité en cours
   const stable = useRef(true);
   const stableSince = useRef(0);
   const unstableMs = useRef(0);
@@ -623,7 +638,7 @@ function TraceCollect() {
         gx: gNow.current.x, gy: gNow.current.y, gMag: gNow.current.mag,
         speed: speedRef.current,
         elapsed: (Date.now() - startAt.current) / 1000,
-        count: eventsRef.current.filter((e) => !e.inv && e.type !== "road").length, // seuls les gestes pénalisés comptent
+        count: eventsRef.current.filter(countsForScore).length, // seuls les gestes pénalisés comptent
         cal: fwd.current.locked,
         stable: stable.current,
         unstableSec: Math.round(unstableMs.current / 1000),
@@ -636,7 +651,7 @@ function TraceCollect() {
   // pousse un événement : pénalité + données du trajet ; visible au journal
   // seulement si non silencieux (les chocs involontaires restent dans l'export)
   const pushEvent = useCallback((type, g, pen, extra, silent, atMs) => {
-    const sev = type === "speed" ? (pen >= PEN_SPEED.hardAt ? "hard" : "med") : pen === 0 ? "light" : sevOf(g);
+    const sev = type === "speed" ? ((extra && extra.over >= TH_SPEED.hard) ? "hard" : "med") : pen === 0 ? "light" : sevOf(g);
     penalty.current += pen;
     const ev = { t: ((atMs || Date.now()) - startAt.current) / 1000, g, sev, type: type || "jolt", ...(extra || {}) };
     eventsRef.current = [...eventsRef.current, ev];
@@ -677,14 +692,19 @@ function TraceCollect() {
         const rot = Math.sqrt(r.alpha ** 2 + r.beta ** 2 + r.gamma ** 2);
         rotEma.current += 0.15 * (rot - rotEma.current);
         if (stable.current && rotEma.current > ROT_UNSTABLE) {
-          stable.current = false; stableSince.current = 0;
-          fwd.current = { x: 0, y: 0, z: 0, acc: 0, locked: false }; // le téléphone a bougé → la matrice d'orientation est fausse, on la réapprend
+          stable.current = false; stableSince.current = 0; unstableStartAt.current = now;
         }
         else if (!stable.current) {
           unstableMs.current += dt;
           if (rotEma.current < ROT_STABLE) {
             stableSince.current += dt;
-            if (stableSince.current >= STABLE_DELAY) { stable.current = true; grav.current.set = false; } // re-calibre la gravité
+            if (stableSince.current >= STABLE_DELAY) {
+              stable.current = true; grav.current.set = false; // re-calibre la gravité
+              // l'axe avant n'est jeté que si l'instabilité a duré (vraie manipulation) ;
+              // un choc bref fait tourner le gyro mais ne réoriente pas le téléphone
+              if (now - unstableStartAt.current - STABLE_DELAY >= ROT_RESET_MS)
+                fwd.current = { x: 0, y: 0, z: 0, acc: 0, locked: false };
+            }
           } else stableSince.current = 0;
         }
       }
@@ -837,6 +857,14 @@ function TraceCollect() {
         if (validQueue.current.length) {
           const keep = [];
           for (const q of validQueue.current) {
+            if (q.confirmed) {
+              // 2e étage (freinages confirmés) : un freinage qui mène à l'arrêt
+              // est une action justifiée, pas une faute
+              if (now - q.at < STOP.checkMs) { keep.push(q); continue; }
+              if (kmh <= STOP.kmh) pushEvent("brake_stop", q.g, 0, { justified: true }, true, q.at);
+              else pushEvent("brake", q.g, penOfG(q.g), null, false, q.at);
+              continue;
+            }
             if (now - q.at < VALID.windowMs) { keep.push(q); continue; }
             const dv = kmh - q.kmh0;
             let dh = 0;
@@ -847,8 +875,9 @@ function TraceCollect() {
               : q.type === "accel" ? dv >= VALID.dKmh
               : q.type === "turn" ? dh >= VALID.dDeg
               : (Math.abs(dv) >= VALID.dKmh || dh >= VALID.dDeg); // à-coup non classé : une conséquence quelconque
-            if (ok) pushEvent(q.type, q.g, penOfG(q.g), null, false, q.at);      // vrai geste → pénalisé, visible
-            else pushEvent(q.type, q.g, 0, { inv: 1 }, true, q.at);              // choc involontaire → silencieux, zéro pénalité
+            if (!ok) { pushEvent(q.type, q.g, 0, { inv: 1 }, true, q.at); continue; } // choc involontaire → silencieux, zéro pénalité
+            if (q.type === "brake") { q.confirmed = true; keep.push(q); continue; }   // 2e étage : mène-t-il à un arrêt ?
+            pushEvent(q.type, q.g, penOfG(q.g), null, false, q.at);                   // vrai geste → pénalisé, visible
           }
           validQueue.current = keep;
         }
@@ -1263,7 +1292,7 @@ function RoleAsk({ trip, onPick, onDiscard }) {
 // ---------------- SUMMARY ----------------
 function Summary({ trip, trips, onAgain, onPassport, onHome }) {
   const g = gradeOf(trip.score);
-  const realEv = (trip.events || []).filter((e) => !e.inv && e.type !== "road"); // gestes pénalisés uniquement
+  const realEv = (trip.events || []).filter(countsForScore); // gestes pénalisés uniquement
   const c = { brake: 0, accel: 0, turn: 0, jolt: 0, speed: 0, road: 0 };
   realEv.forEach((e) => c[e.type || "jolt"]++);
   const lines = trip.role === "passenger" ? [] : coachLines(realEv);
@@ -1324,7 +1353,7 @@ function RouteTrace({ trip }) {
   const sx = (lo) => pad + ((lo - minLo) / Math.max(maxLo - minLo, 1e-6)) * (W - pad * 2);
   const sy = (la) => H - pad - ((la - minLa) / Math.max(maxLa - minLa, 1e-6)) * (H - pad * 2);
   const d = pts.map((p, i) => `${i ? "L" : "M"}${sx(p[1]).toFixed(1)},${sy(p[0]).toFixed(1)}`).join(" ");
-  const evPts = (trip.events || []).filter((e) => !e.inv && e.type !== "road").map((e) => {
+  const evPts = (trip.events || []).filter(countsForScore).map((e) => {
     let best = pts[0], bd = Infinity;
     for (const p of pts) { const dd = Math.abs(p[2] - e.t); if (dd < bd) { bd = dd; best = p; } }
     return { x: sx(best[1]), y: sy(best[0]), sev: e.sev, type: e.type };
@@ -1353,7 +1382,7 @@ function Passport({ trips, chainOk, onHome, onExport }) {
   const totalSec = real.reduce((s, t) => s + t.durationSec, 0);
   const totalKm = Math.round(real.reduce((s, t) => s + (t.distanceKm || 0), 0) * 10) / 10;
   const allEv = real.flatMap((t) => t.events || []);
-  const penEv = allEv.filter((e) => e.type !== "road" && !e.inv); // ni chocs de route ni chocs invalidés
+  const penEv = allEv.filter(countsForScore); // ni chocs de route, ni invalidés, ni freinages justifiés
   const c = { brake: 0, accel: 0, turn: 0, jolt: 0, speed: 0, road: 0 };
   penEv.forEach((e) => c[e.type || "jolt"]++);
   const hours = Math.max(totalSec / 3600, 1 / 60);
